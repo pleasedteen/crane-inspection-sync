@@ -39,7 +39,8 @@ class SyncConfig:
     window_source_window: float = 5.0
     cooldown_seconds: float = 0.5           # 收到 429 后的客户端冷却
     window_minutes: int = 30
-    window_horizon: str = "2026-11-12T00:00:00"
+    window_start: str = "2026-11-10T08:00:00"  # 时间窗源配置范围下界
+    window_horizon: str = "2026-11-12T00:00:00"  # 时间窗源配置范围上界
     sources: tuple[str, ...] = ("offset", "cursor", "window")
     on_page: Callable[[str, int], Awaitable[None]] | None = None
 
@@ -117,6 +118,7 @@ class SyncEngine:
                 self.window_limiter,
                 window_minutes=cfg.window_minutes,
                 horizon=cfg.window_horizon,
+                window_start=cfg.window_start,
                 **common,
             )
         return fetchers

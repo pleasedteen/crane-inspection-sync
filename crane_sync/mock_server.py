@@ -123,6 +123,14 @@ class GatewayState:
         self._cursor_rotate_after = cursor_rotate_after
         self.datasets = datasets
         self.stats = {"gateway_requests": 0, "renewals": 0, "rejected_429": 0}
+        # 时间窗源版本化数据集：供应商补送迟到单/修订已扫单都会产生新版本。
+        # 客户端轮次探测时冻结版本号，数据请求按版本读取，途中变动自然留到下轮。
+        self._window_version = 1
+        self._window_versions: dict[int, list[dict]] = {
+            1: list(datasets["window"])
+        }
+        # 新版本 -> 该版本受影响记录的 inspected_at 列表（用于增量下界）
+        self._window_changes: dict[int, list[str]] = {}
 
     def _build_cursor_manifest(self, rows: list[dict], version: int) -> list[dict]:
         if version == 1:
@@ -182,6 +190,10 @@ class GatewayState:
     def cursor_version(self) -> int:
         return self._cursor_version
 
+    @property
+    def window_version(self) -> int:
+        return self._window_version
+
     def cursor_manifest(self) -> list[dict]:
         return list(self._cursor_rows)
 
@@ -193,6 +205,83 @@ class GatewayState:
                     self.datasets["cursor"], 2
                 )
             return self._cursor_version
+
+    # ---- 时间窗源：供应商补送迟到单 / 修订已扫单 ----
+    def _commit_window_version(
+        self, rows: list[dict], affected_at: list[str]
+    ) -> int:
+        self._window_version += 1
+        version = self._window_version
+        self._window_versions[version] = rows
+        if affected_at:
+            self._window_changes[version] = sorted(set(affected_at))
+        # datasets["window"] 始终指向最新版本，保持旧测试可见
+        self.datasets["window"] = rows
+        return version
+
+    def window_current_rows(self, version: int | None = None) -> list[dict]:
+        with self._lock:
+            if version is None:
+                version = self._window_version
+            return list(self._window_versions[version])
+
+    def deliver_late_order(self, order: dict) -> int:
+        """补送一张迟到的巡检单（时间戳通常落在已扫过的窗口里）。"""
+        with self._lock:
+            rows = [dict(r) for r in self._window_versions[self._window_version]]
+            if not any(
+                r["order_id"] == order["order_id"]
+                and r["revision"] == order["revision"]
+                for r in rows
+            ):
+                rows.append(dict(order))
+            return self._commit_window_version(rows, [str(order["inspected_at"])])
+
+    def revise_window_order(self, order_id: str, gaps: list[dict]) -> int:
+        """修订已扫过的单：追加一个更高修订号，保持原 inspected_at。"""
+        with self._lock:
+            rows = [dict(r) for r in self._window_versions[self._window_version]]
+            revisions = [
+                int(r["revision"])
+                for r in rows
+                if r["order_id"] == order_id
+            ]
+            if not revisions:
+                raise KeyError(f"窗口数据集中不存在单号 {order_id}")
+            base = next(r for r in rows if r["order_id"] == order_id
+                        and int(r["revision"]) == max(revisions))
+            new_rev = max(revisions) + 1
+            revised = dict(base)
+            revised["revision"] = new_rev
+            revised["gaps"] = gaps
+            rows.append(revised)
+            return self._commit_window_version(
+                rows, [str(base["inspected_at"])]
+            )
+
+    def window_status(self, since_version: int | None) -> dict:
+        """时间窗源探测：数据版本、源端确认范围与相对 since 的增量下界。"""
+        with self._lock:
+            version = self._window_version
+            rows = self._window_versions[version]
+            if rows:
+                data_from = min(r["inspected_at"] for r in rows)
+                data_to = max(r["inspected_at"] for r in rows)
+            else:
+                data_from = data_to = None
+            rescan_from = None
+            if since_version is None or since_version < version:
+                affected: list[str] = []
+                for ver, ats in self._window_changes.items():
+                    if since_version is None or ver > since_version:
+                        affected.extend(ats)
+                rescan_from = min(affected) if affected else data_from
+            return {
+                "data_version": version,
+                "confirmed_from": data_from,
+                "confirmed_to": data_to,
+                "rescan_from": rescan_from,
+            }
 
 
 # ----------------------------------------------------------------------
@@ -249,6 +338,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._handle_cursor_orders(qs)
             if path == "/window/orders":
                 return self._handle_window(qs)
+            if path == "/window/status":
+                return self._handle_window_status(qs)
             if path == "/mock/admin/stats":
                 return self._send_json(200, self.state.admin_stats())
             self._send_json(404, {"error": "not found", "path": path})
@@ -283,7 +374,28 @@ class _Handler(BaseHTTPRequestHandler):
         if parsed.path == "/mock/admin/expire-token":
             self.state.gateway.force_token_expiry()
             return self._send_json(200, {"expired": True})
+        if parsed.path == "/mock/admin/window-deliver":
+            payload = self._read_json_body()
+            new_version = self.state.gateway.deliver_late_order(payload["order"])
+            return self._send_json(200, {"data_version": new_version})
+        if parsed.path == "/mock/admin/window-revise":
+            payload = self._read_json_body()
+            try:
+                new_version = self.state.gateway.revise_window_order(
+                    payload["order_id"], payload["gaps"]
+                )
+            except KeyError as exc:
+                return self._send_json(404, {"error": str(exc)})
+            return self._send_json(200, {"data_version": new_version})
         self._send_json(404, {"error": "not found", "path": parsed.path})
+
+    def _read_json_body(self) -> dict:
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            return json.loads(raw or b"{}")
+        except json.JSONDecodeError:
+            return {}
 
     # ---------------- 三个来源 ----------------
     def _handle_offset(self, qs: dict):
@@ -356,6 +468,28 @@ class _Handler(BaseHTTPRequestHandler):
             },
         )
 
+    def _handle_window_status(self, qs: dict):
+        # 探测同样占用时间窗源的独立额度（无令牌）
+        ok, retry = self.state.window_quota.allow()
+        if not ok:
+            self.state.window_rejected += 1
+            return self._send_json(
+                429,
+                {"error": "window source quota exhausted"},
+                {"Retry-After": round(retry, 3)},
+            )
+        since_raw = qs.get("since_version")
+        since_version = None
+        if since_raw not in (None, ""):
+            try:
+                since_version = int(since_raw)
+            except ValueError:
+                return self._send_json(400, {"error": "bad since_version"})
+        self.state.window_probe_requests += 1
+        return self._send_json(
+            200, self.state.gateway.window_status(since_version)
+        )
+
     def _handle_window(self, qs: dict):
         # 时间窗源：独立额度，无令牌
         ok, retry = self.state.window_quota.allow()
@@ -366,7 +500,13 @@ class _Handler(BaseHTTPRequestHandler):
                 {"error": "window source quota exhausted"},
                 {"Retry-After": round(retry, 3)},
             )
-        rows = self.state.gateway.datasets["window"]
+        # 版本钉选：客户端在轮次开始时冻结版本，途中补送/修订不会进入本轮
+        version_raw = qs.get("version")
+        try:
+            version = int(version_raw) if version_raw not in (None, "") else None
+        except ValueError:
+            return self._send_json(400, {"error": "bad version"})
+        rows = self.state.gateway.window_current_rows(version)
         frm = qs.get("from")
         to = qs.get("to")
         if not frm or not to:
@@ -374,11 +514,13 @@ class _Handler(BaseHTTPRequestHandler):
         # 闭区间 [from, to]：相邻窗口在边界上重叠，边界记录会重复返回
         selected = [r for r in rows if frm <= r["inspected_at"] <= to]
         selected.sort(key=lambda r: (r["inspected_at"], r["order_id"], r["revision"]))
+        self.state.window_data_requests += 1
         self._send_json(
             200,
             {
                 "orders": selected,
                 "count": len(selected),
+                "data_version": version or self.state.gateway.window_version,
                 "window": {"from": frm, "to": to},
             },
         )
@@ -409,12 +551,18 @@ class MockServer(ThreadingHTTPServer):
         )
         self.window_quota = SlidingWindow(window_quota, window_window)
         self.window_rejected = 0
+        # 时间窗源请求计数：探测与数据请求分开统计
+        self.window_probe_requests = 0
+        self.window_data_requests = 0
 
     def admin_stats(self) -> dict:
         ds = self.gateway.datasets
         return {
             "gateway": self.gateway.stats,
             "window_rejected_429": self.window_rejected,
+            "window_probe_requests": self.window_probe_requests,
+            "window_data_requests": self.window_data_requests,
+            "window_data_version": self.gateway.window_version,
             "dataset_sizes": {k: len(v) for k, v in ds.items()},
             "cursor_version": self.gateway.cursor_version,
         }

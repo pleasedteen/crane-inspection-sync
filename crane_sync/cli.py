@@ -63,6 +63,7 @@ def cmd_serve(args) -> int:
                     "window_source_window": args.window_window,
                     "cooldown_seconds": 0.5,
                     "window_minutes": 30,
+                    "window_start": args.window_start,
                     "window_horizon": "2026-11-12T00:00:00",
                 },
                 ensure_ascii=False,
@@ -162,6 +163,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--window-window", type=float, default=5.0)
     p_serve.add_argument("--token-ttl", type=float, default=300.0)
     p_serve.add_argument("--cursor-rotate-after", type=int, default=None)
+    p_serve.add_argument(
+        "--window-start", default="2026-11-10T08:00:00",
+        help="时间窗源配置范围下界（同步只覆盖该时间之后的变动）",
+    )
     p_serve.set_defaults(func=cmd_serve)
 
     p_sync = sub.add_parser("sync", help="执行一轮同步并发布各来源快照")

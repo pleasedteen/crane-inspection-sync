@@ -55,10 +55,19 @@ def make_config(base_url: str, state_dir: str, **overrides) -> SyncConfig:
         window_source_window=1.0,
         cooldown_seconds=0.2,
         window_minutes=30,
+        window_start="2026-11-10T08:00:00",
         window_horizon="2026-11-12T00:00:00",
     )
     cfg.update(overrides)
     return SyncConfig(**cfg)
+
+
+def run_sync(base_url: str, state_dir: str, **overrides) -> dict:
+    engine = SyncEngine(make_config(base_url, state_dir, **overrides))
+    try:
+        return asyncio.run(engine.run())
+    finally:
+        engine.close()
 
 
 def admin_stats(base_url: str) -> dict:
@@ -480,6 +489,276 @@ class EndToEndTests(unittest.TestCase):
         finally:
             server.shutdown()
             tmp.cleanup()
+
+
+class WindowIncrementalTests(unittest.TestCase):
+    """时间窗源增量同步：探测、版本钉选、补送/修订补齐与续跑。"""
+
+    LATE_ORDER = {
+        "order_id": "QC-LATE1",
+        "revision": 1,
+        # 迟到单：时间戳落在第一轮早已扫过的窗口里
+        "inspected_at": "2026-11-10T09:15:00",
+        "gaps": [{"point": "rail", "value": 9.0, "unit": "mm"}],
+    }
+
+    def setUp(self):
+        self.server = start_server()
+        self.base_url = (
+            f"http://{self.server.server_address[0]}:{self.server.server_address[1]}"
+        )
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state_dir = self.tmp.name
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.tmp.cleanup()
+
+    def test_unchanged_source_costs_one_probe_only(self):
+        run_sync(self.base_url, self.state_dir)
+        probes_after_first = self.server.window_probe_requests
+        data_after_first = self.server.window_data_requests
+        self.assertGreaterEqual(data_after_first, 1)
+
+        # 源端无变化再跑一轮：只允许新增一次探测，不得再拉任何窗口
+        run_sync(self.base_url, self.state_dir)
+        self.assertEqual(
+            self.server.window_probe_requests, probes_after_first + 1
+        )
+        self.assertEqual(self.server.window_data_requests, data_after_first)
+
+        # 再跑一轮仍是一次探测
+        run_sync(self.base_url, self.state_dir)
+        self.assertEqual(
+            self.server.window_probe_requests, probes_after_first + 2
+        )
+        self.assertEqual(self.server.window_data_requests, data_after_first)
+
+    def test_late_order_is_backfilled_with_incremental_windows_only(self):
+        results1 = run_sync(self.base_url, self.state_dir)
+        full_windows = self.server.window_data_requests
+        storage = Storage(self.state_dir)
+        before = storage.read_snapshot("window")
+        before_ids = {r["order_id"] for r in before}
+        storage.close()
+        self.assertNotIn("QC-LATE1", before_ids)
+
+        # 供应商补送一张迟到单（旧时间戳）
+        self.server.gateway.deliver_late_order(dict(self.LATE_ORDER))
+        self.server.window_data_requests = 0
+        results2 = run_sync(self.base_url, self.state_dir)
+
+        # 第二轮只拉增量窗口，远少于首轮全量窗口
+        incremental_windows = self.server.window_data_requests
+        self.assertLess(incremental_windows, full_windows)
+        self.assertGreaterEqual(incremental_windows, 1)
+
+        storage = Storage(self.state_dir)
+        after = storage.read_snapshot("window")
+        storage.close()
+        ids = {r["order_id"] for r in after}
+        self.assertIn("QC-LATE1", ids)
+        # 原有单据一条不少；快照按单号折叠，迟到单只出现一次
+        self.assertTrue(before_ids.issubset(ids))
+        self.assertEqual(len(ids), len(after))
+        # 重新发布产生了新快照 ID
+        self.assertNotEqual(
+            results1["window"]["snapshot_id"], results2["window"]["snapshot_id"]
+        )
+
+        # 再跑一轮：源端无变化，只剩一次探测
+        self.server.window_data_requests = 0
+        run_sync(self.base_url, self.state_dir)
+        self.assertEqual(self.server.window_data_requests, 0)
+
+    def test_revision_keeps_highest_revision_and_mm_units(self):
+        storage = Storage(self.state_dir)
+        target_id = self.server.gateway.window_current_rows()[0]["order_id"]
+        storage.close()
+
+        run_sync(self.base_url, self.state_dir)
+        storage = Storage(self.state_dir)
+        rev_before = next(
+            r["revision"]
+            for r in storage.read_snapshot("window")
+            if r["order_id"] == target_id
+        )
+        storage.close()
+
+        # 供应商修订已扫过的单：微米单位，验证毫米归一
+        self.server.gateway.revise_window_order(
+            target_id, [{"point": "rail", "value": 7500, "unit": "um"}]
+        )
+        self.server.window_data_requests = 0
+        run_sync(self.base_url, self.state_dir)
+        self.assertGreaterEqual(self.server.window_data_requests, 1)
+
+        storage = Storage(self.state_dir)
+        snap = storage.read_snapshot("window")
+        storage.close()
+        target_rows = [r for r in snap if r["order_id"] == target_id]
+        self.assertEqual(len(target_rows), 1)  # 单号仍唯一
+        row = target_rows[0]
+        self.assertEqual(row["revision"], rev_before + 1)  # 只保留最高修订
+        self.assertEqual(row["gaps"][0]["unit"], "mm")
+        self.assertAlmostEqual(row["gaps"][0]["value_mm"], 7.5, places=6)
+
+    def test_mid_round_change_waits_for_next_round(self):
+        run_sync(self.base_url, self.state_dir)
+        storage = Storage(self.state_dir)
+        before_ids = {r["order_id"] for r in storage.read_snapshot("window")}
+        storage.close()
+
+        # 先制造一个变动，让本轮探测到 v2 并开始拉窗口；
+        # 拉到第一个窗口时再补送一张单（v3），本轮已钉住 v2，不应看到它
+        late = dict(self.LATE_ORDER)
+        late["order_id"] = "QC-MIDROUND"
+        self.server.gateway.deliver_late_order(
+            dict(self.LATE_ORDER, order_id="QC-PREROUND")
+        )
+
+        async def deliver_mid_round(source: str, pages: int):
+            if source == "window" and pages == 1 and not hook_state["fired"]:
+                hook_state["fired"] = True
+                self.server.gateway.deliver_late_order(late)
+
+        hook_state = {"fired": False}
+        run_sync(
+            self.base_url,
+            self.state_dir,
+            sources=("window",),
+            on_page=deliver_mid_round,
+        )
+        self.assertTrue(hook_state["fired"])
+
+        storage = Storage(self.state_dir)
+        ids = {r["order_id"] for r in storage.read_snapshot("window")}
+        storage.close()
+        self.assertIn("QC-PREROUND", ids)       # 探测前的变动本轮补齐
+        self.assertNotIn("QC-MIDROUND", ids)    # 途中补送留到下轮
+        self.assertTrue(before_ids.issubset(ids))
+
+        # 下一轮只探测一次即发现 v3，增量补齐途中补送的单
+        self.server.window_data_requests = 0
+        run_sync(self.base_url, self.state_dir, sources=("window",))
+        self.assertGreaterEqual(self.server.window_data_requests, 1)
+        storage = Storage(self.state_dir)
+        ids = {r["order_id"] for r in storage.read_snapshot("window")}
+        storage.close()
+        self.assertIn("QC-MIDROUND", ids)
+
+    def test_kill_resume_uses_frozen_plan_and_keeps_snapshot_readable(self):
+        # 第一轮先发布一份可读快照
+        run_sync(self.base_url, self.state_dir)
+        storage = Storage(self.state_dir)
+        before = storage.read_snapshot("window")
+        before_ids = {r["order_id"] for r in before}
+        storage.close()
+
+        self.server.gateway.deliver_late_order(
+            dict(self.LATE_ORDER, order_id="QC-RESUME")
+        )
+        page_log: dict[str, int] = {}
+
+        async def abort_hook(source: str, pages: int):
+            if source != "window":
+                return
+            page_log[source] = pages
+            if pages >= 2:
+                raise AbortSync("模拟强杀")
+
+        with self.assertRaises(AbortSync):
+            run_sync(
+                self.base_url,
+                self.state_dir,
+                sources=("window",),
+                on_page=abort_hook,
+            )
+        self.assertGreaterEqual(page_log.get("window", 0), 2)
+
+        # 强杀后：未完成轮次的冻结计划已落盘，上一份快照仍可读
+        storage = Storage(self.state_dir)
+        progress = storage.get_progress("window")
+        self.assertTrue(progress["active"])
+        self.assertIn("data_version", progress)
+        readable = {r["order_id"] for r in storage.read_snapshot("window")}
+        self.assertEqual(readable, before_ids)
+        storage.close()
+
+        probes_before = self.server.window_probe_requests
+        self.server.window_data_requests = 0
+        # 续跑：沿用冻结计划，不重新探测
+        run_sync(self.base_url, self.state_dir, sources=("window",))
+        self.assertEqual(self.server.window_probe_requests, probes_before)
+        self.assertGreaterEqual(self.server.window_data_requests, 1)
+
+        storage = Storage(self.state_dir)
+        progress = storage.get_progress("window")
+        self.assertFalse(progress["active"])
+        ids = {r["order_id"] for r in storage.read_snapshot("window")}
+        storage.close()
+        self.assertIn("QC-RESUME", ids)
+        self.assertTrue(before_ids.issubset(ids))
+
+    def test_window_quota_independent_from_gateway(self):
+        # 时间窗源独立额度收紧：429 冷却重试后仍完整，且不影响网关来源
+        server = start_server(window_quota=1, window_window=0.3)
+        base_url = (
+            f"http://{server.server_address[0]}:{server.server_address[1]}"
+        )
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            # 缩短配置范围，窗口数少、测试更快；
+            # 客户端额度比服务端宽松， burst 请求必然撞上服务端 429，
+            # 验证冷却重试与独立额度（网关来源不受牵连）
+            results = run_sync(
+                base_url,
+                tmp.name,
+                window_source_quota=3,
+                window_source_window=0.3,
+                window_horizon="2026-11-10T12:00:00",
+            )
+            self.assertGreaterEqual(server.window_rejected, 1)
+            raw = server.gateway.window_current_rows()
+            expected = {
+                r["order_id"]
+                for r in raw
+                if r["inspected_at"] <= "2026-11-10T12:00:00"
+            }
+            storage = Storage(tmp.name)
+            got = {r["order_id"] for r in storage.read_snapshot("window")}
+            storage.close()
+            self.assertEqual(got, expected)
+            # 共享网关的两个来源不受时间窗额度拖累，正常发布
+            self.assertIn("offset", results)
+            self.assertIn("cursor", results)
+        finally:
+            server.shutdown()
+            tmp.cleanup()
+
+    def test_change_outside_configured_range_is_skipped(self):
+        run_sync(self.base_url, self.state_dir)
+        # 补送一张晚于配置 horizon 的单：探测得到变化，但无窗口请求
+        late = dict(
+            self.LATE_ORDER,
+            order_id="QC-FUTURE",
+            inspected_at="2026-11-13T09:00:00",
+        )
+        self.server.gateway.deliver_late_order(late)
+        probes_before = self.server.window_probe_requests
+        self.server.window_data_requests = 0
+        run_sync(self.base_url, self.state_dir)
+        self.assertEqual(self.server.window_probe_requests, probes_before + 1)
+        self.assertEqual(self.server.window_data_requests, 0)
+        storage = Storage(self.state_dir)
+        ids = {r["order_id"] for r in storage.read_snapshot("window")}
+        storage.close()
+        self.assertNotIn("QC-FUTURE", ids)
+
+        # 再跑一轮：该版本已记账为完成，源端"无变化"，仍只有一次探测
+        self.server.window_data_requests = 0
+        run_sync(self.base_url, self.state_dir)
+        self.assertEqual(self.server.window_data_requests, 0)
 
 
 class SubprocessCliTests(unittest.TestCase):

@@ -9,5 +9,6 @@
   "window_source_window": 5.0,
   "cooldown_seconds": 0.5,
   "window_minutes": 30,
+  "window_start": "2026-11-10T08:00:00",
   "window_horizon": "2026-11-12T00:00:00"
 }

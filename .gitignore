@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 本地运行态（同步进度/暂存/快照）
+state/
+*.db
+*.db-wal
+*.db-shm
+
+# 本地模拟源生成的连接配置
+mock.json
