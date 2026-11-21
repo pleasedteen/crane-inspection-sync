@@ -19,6 +19,18 @@ from typing import Awaitable, Callable, TypeVar
 
 T = TypeVar("T")
 
+# 诊断探针：probe(owner, state, detail)
+# state ∈ waiting_quota | cooldown | waiting_reply | processing | ...
+Probe = Callable[[object, str, dict], None]
+
+
+def _emit(probe: Probe | None, owner: object, state: str, **detail) -> None:
+    if probe is not None:
+        try:
+            probe(owner, state, detail)
+        except Exception:  # 观测失败绝不能影响同步
+            pass
+
 
 class CooldownGate:
     """冷却门：冷却期内 wait() 阻塞，冷却结束自动放行。"""
@@ -33,9 +45,13 @@ class CooldownGate:
     def remaining(self) -> float:
         return max(0.0, self._until - self._clock())
 
-    async def wait_ready(self) -> None:
+    async def wait_ready(
+        self, on_wait: Callable[[float], None] | None = None
+    ) -> None:
         remaining = self.remaining()
         if remaining > 0:
+            if on_wait is not None:
+                on_wait(remaining)
             await asyncio.sleep(remaining)
 
 
@@ -141,6 +157,15 @@ class GatewayError(Exception):
     """网关其他错误（4xx/5xx、网络错误）。"""
 
 
+class HttpStatusError(GatewayError):
+    """携带 HTTP 状态码的网关错误，便于诊断区分"HTTP 回包"类型。"""
+
+    def __init__(self, status: int, body: str):
+        super().__init__(f"HTTP {status}: {body}")
+        self.status = status
+        self.body = body
+
+
 class SharedGateway:
     """偏移源/游标源共用的网关：共享额度 + 共享令牌。"""
 
@@ -150,6 +175,7 @@ class SharedGateway:
         cooldown: CooldownGate,
         token_provider: Callable[[], Awaitable[str]],
         clock: Callable[[], float] = time.monotonic,
+        probe: Probe | None = None,
     ):
         self.quota = quota
         self.cooldown = cooldown
@@ -159,6 +185,7 @@ class SharedGateway:
         self._token: str | None = None
         self._generation = 0          # 令牌世代，续期一次 +1
         self._renewed_generation: set[int] = set()
+        self.probe = probe
 
     async def _current_token(self) -> tuple[str, int]:
         async with self._token_lock:
@@ -181,6 +208,9 @@ class SharedGateway:
             self._renewed_generation.add(failed_generation)
             return new_token
 
+    def generation(self) -> int:
+        return self._generation
+
     async def request(
         self,
         send: Callable[[str | None], Awaitable[T]],
@@ -196,18 +226,39 @@ class SharedGateway:
             attempts += 1
             if attempts > 6:
                 raise GatewayError("重试次数过多，网关持续不可用")
-            await self.cooldown.wait_ready()
+            _emit(self.probe, owner, "waiting_quota", attempt=attempts)
+            await self.cooldown.wait_ready(
+                lambda secs: _emit(
+                    self.probe, owner, "cooldown", remaining=round(secs, 3)
+                )
+            )
             await self.quota.acquire(owner)
             token, generation = await self._current_token()
+            _emit(
+                self.probe,
+                owner,
+                "waiting_reply",
+                token_generation=generation,
+                attempt=attempts,
+            )
             try:
                 return await send(token)
             except AuthError:
                 # 续期要占额度：先排队拿额度，再调 provider
-                await self.cooldown.wait_ready()
+                _emit(self.probe, owner, "renewing_token",
+                      token_generation=generation)
+                await self.cooldown.wait_ready(
+                    lambda secs: _emit(
+                        self.probe, owner, "cooldown", remaining=round(secs, 3),
+                        during="token_renewal",
+                    )
+                )
                 await self.quota.acquire(("token", owner))
                 await self._renew_token(generation)
                 continue
             except RateLimited as exc:
+                _emit(self.probe, owner, "cooldown",
+                      remaining=round(exc.retry_after, 3))
                 await self.cooldown.cooldown(exc.retry_after)
                 continue
 
@@ -215,9 +266,15 @@ class SharedGateway:
 class IndependentLimiter:
     """时间窗源使用的独立额度 + 冷却。"""
 
-    def __init__(self, quota: WindowQuota, cooldown: CooldownGate):
+    def __init__(
+        self,
+        quota: WindowQuota,
+        cooldown: CooldownGate,
+        probe: Probe | None = None,
+    ):
         self.quota = quota
         self.cooldown = cooldown
+        self.probe = probe
 
     async def request(self, send: Callable[[None], Awaitable[T]],
                       owner: object = "default") -> T:
@@ -226,10 +283,18 @@ class IndependentLimiter:
             attempts += 1
             if attempts > 6:
                 raise GatewayError("重试次数过多，来源持续不可用")
-            await self.cooldown.wait_ready()
+            _emit(self.probe, owner, "waiting_quota", attempt=attempts)
+            await self.cooldown.wait_ready(
+                lambda secs: _emit(
+                    self.probe, owner, "cooldown", remaining=round(secs, 3)
+                )
+            )
             await self.quota.acquire(owner)
+            _emit(self.probe, owner, "waiting_reply", attempt=attempts)
             try:
                 return await send(None)
             except RateLimited as exc:
+                _emit(self.probe, owner, "cooldown",
+                      remaining=round(exc.retry_after, 3))
                 await self.cooldown.cooldown(exc.retry_after)
                 continue

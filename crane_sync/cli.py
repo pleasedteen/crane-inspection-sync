@@ -4,6 +4,8 @@
   python -m crane_sync serve   --config-out mock.json [--port 0]
   python -m crane_sync sync    --config config.json [--format jsonl|parquet]
   python -m crane_sync read    --state-dir ./state [--source offset] [--merged]
+  python -m crane_sync diagnose --state-dir ./state [--source offset] [--json]
+  python -m crane_sync selftest [--keep]
 """
 from __future__ import annotations
 
@@ -40,6 +42,7 @@ def cmd_serve(args) -> int:
             "window_window": args.window_window,
             "token_ttl": args.token_ttl,
             "cursor_rotate_after": args.cursor_rotate_after,
+            "response_delay": args.response_delay,
         }
     )
     host, port = server.server_address
@@ -145,6 +148,36 @@ def cmd_read(args) -> int:
     return 0
 
 
+def cmd_diagnose(args) -> int:
+    from .diagnostics import build_report, render_report
+
+    if not Path(args.state_dir).exists():
+        print(f"读取失败: 状态目录不存在: {args.state_dir}", file=sys.stderr)
+        return 2
+    storage = Storage(args.state_dir)
+    try:
+        sources = None
+        if args.source:
+            sources = [s.strip() for s in args.source.split(",") if s.strip()]
+        report = build_report(storage, sources=sources, attempt_limit=args.limit)
+    except Exception as exc:  # 诊断本身不应崩溃
+        print(f"诊断失败: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        storage.close()
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print(render_report(report))
+    return 0
+
+
+def cmd_selftest(args) -> int:
+    from .selftest import run_selftest
+
+    return run_selftest(keep=args.keep)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="crane_sync", description="岸桥巡检单三源同步")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -162,6 +195,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--window-window", type=float, default=5.0)
     p_serve.add_argument("--token-ttl", type=float, default=300.0)
     p_serve.add_argument("--cursor-rotate-after", type=int, default=None)
+    p_serve.add_argument(
+        "--response-delay", type=float, default=0.0,
+        help="每个数据响应人为延迟的秒数，用于演示在途请求与强停",
+    )
     p_serve.set_defaults(func=cmd_serve)
 
     p_sync = sub.add_parser("sync", help="执行一轮同步并发布各来源快照")
@@ -176,6 +213,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_read.add_argument("--source", default=None, help="只读某个来源，如 offset")
     p_read.add_argument("--merged", action="store_true", help="跨来源合并，仅保留最高修订")
     p_read.set_defaults(func=cmd_read)
+
+    p_diag = sub.add_parser(
+        "diagnose", help="本地诊断：各源等额度/冷却/等回包，续点与近期请求"
+    )
+    p_diag.add_argument("--state-dir", required=True)
+    p_diag.add_argument(
+        "--source", default=None,
+        help="只看这些来源（逗号分隔），默认全部",
+    )
+    p_diag.add_argument(
+        "--limit", type=int, default=10, help="每个来源展示的近期请求条数"
+    )
+    p_diag.add_argument("--json", action="store_true", help="输出 JSON 便于脚本处理")
+    p_diag.set_defaults(func=cmd_diagnose)
+
+    p_self = sub.add_parser(
+        "selftest", help="用内置模拟源一键验证等待、强停与续跑"
+    )
+    p_self.add_argument("--keep", action="store_true", help="保留临时状态目录")
+    p_self.set_defaults(func=cmd_selftest)
     return parser
 
 

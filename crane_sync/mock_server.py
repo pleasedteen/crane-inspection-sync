@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import time
 from collections import deque
@@ -218,6 +219,12 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _maybe_delay(self) -> None:
+        """模拟慢响应：便于演示"请求在途时进程被强停"。"""
+        delay = getattr(self.state, "response_delay", 0.0)
+        if delay > 0:
+            time.sleep(delay)
+
     def _gateway_authorized(self) -> bool:
         """额度+令牌校验；失败时已写出响应，返回 False。"""
         ok, retry = self.state.gateway.charge()
@@ -233,6 +240,7 @@ class _Handler(BaseHTTPRequestHandler):
         if not self.state.gateway.check_token(token):
             self._send_json(401, {"error": "invalid or expired token"})
             return False
+        self._maybe_delay()
         return True
 
     # ---------------- GET 路由 ----------------
@@ -366,6 +374,7 @@ class _Handler(BaseHTTPRequestHandler):
                 {"error": "window source quota exhausted"},
                 {"Retry-After": round(retry, 3)},
             )
+        self._maybe_delay()
         rows = self.state.gateway.datasets["window"]
         frm = qs.get("from")
         to = qs.get("to")
@@ -388,6 +397,15 @@ class MockServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def handle_error(self, request, client_address):
+        # 客户端在响应前被强停时会写向已关闭的套接字；静默处理
+        exc = sys.exc_info()[1]
+        if isinstance(
+            exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
+        ):
+            return
+        super().handle_error(request, client_address)
+
     def __init__(
         self,
         addr: tuple[str, int],
@@ -409,6 +427,8 @@ class MockServer(ThreadingHTTPServer):
         )
         self.window_quota = SlidingWindow(window_quota, window_window)
         self.window_rejected = 0
+        # 可选的响应延迟（演示在途请求/强停）
+        self.response_delay = 0.0
 
     def admin_stats(self) -> dict:
         ds = self.gateway.datasets
@@ -430,6 +450,7 @@ def serve_forever(config: dict) -> MockServer:
         config.get("token_ttl", 300.0),
         config.get("cursor_rotate_after"),
     )
+    server.response_delay = float(config.get("response_delay", 0.0) or 0.0)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server

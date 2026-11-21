@@ -19,9 +19,10 @@
 python3 run_tests.py
 ```
 
-实测约 22 秒完成 14 项测试，覆盖：毫米/微米归一、三源端到端发布、共享额度与
+实测约 33 秒完成 20 项测试，覆盖：毫米/微米归一、三源端到端发布、共享额度与
 令牌只续期一次、游标清单过期重读且旧快照可读、时间窗边界去重、强制中止后续跑、
-并发公平性、Parquet（有 pyarrow 时）以及真实子进程的 serve→sync→read 链路。
+并发公平性、Parquet（有 pyarrow 时）、真实子进程的 serve→sync→read 链路，
+以及本地诊断（三种等待可区分、200 条保留上限、强停对账、一键自检）。
 
 也可用标准 unittest：
 
@@ -71,6 +72,40 @@ python3 -m crane_sync read --state-dir ./state --source offset
 
 未发布过快照时 `read` 会明确报错并以非零码退出，绝不会读到半成品。
 
+### 4) 本地诊断：当前在等什么、能不能续读
+
+```bash
+# 随时可跑（同步进程正在运行、或已被强停都可以）
+python3 -m crane_sync diagnose --state-dir ./state
+python3 -m crane_sync diagnose --state-dir ./state --source offset,cursor
+python3 -m crane_sync diagnose --state-dir ./state --json   # 供脚本处理
+```
+
+输出按来源区分当前状态：**等额度**（`waiting_quota`）、**冷却**
+（`cooldown`，含剩余秒数）、**等 HTTP 回包**（`waiting_reply`）、续令牌、
+处理回包、发布快照、已完成等；同时列出：
+
+- 每个来源当前的**续点**（偏移 `next_offset`、游标 `next_cursor`、
+  时间窗 `last_to`），进程是否仍存活；
+- 当前**在途**请求（尚未确认回包）；
+- 近期**已确认分页响应**是否形成了可续读进度，标注为
+  `进度已落盘（当前续点）` / `进度已落盘（已被后续页覆盖）` /
+  `已确认回包但进度未落盘`；
+- HTTP 429/401/410 等回包类型，方便区分"限流/令牌失效/游标过期"。
+
+### 5) 一键验证等待、强停与续跑
+
+```bash
+python3 -m crane_sync selftest          # 约 10 秒，全部在本机完成
+python3 -m crane_sync selftest --keep   # 保留临时状态目录以便排查
+```
+
+自检会用内置模拟源起一个真实 sync 子进程，在响应变慢、额度紧张时轮询诊断，
+确认能同时看到"等额度/冷却/等 HTTP 回包"；随后在请求在途时 `SIGKILL`
+强停，验证未确认回包被记为**结果未知**、强停前最后一次确认的分页进度仍可查；
+最后重跑至完成，确认从续点续读、快照发布完整，且重跑后仍能查清强停那次的
+旧尝试是否落盘。
+
 ## 四、关键设计与需求对应
 
 ### 数据正确性
@@ -105,11 +140,25 @@ python3 -m crane_sync read --state-dir ./state --source offset
 - 状态存于 `state/sync_state.db`（SQLite，WAL 模式）：分页进度、暂存记录、已发布
   指针与快照表。
 - **原子发布**：先把完整快照写到不可见临时文件并 `os.replace` 改名，再在一个 DB
-  事务里切换“已发布”指针；维保人员只能读到完整发布后的快照。发布成功后旧快照表
+  事务里切换”已发布”指针；维保人员只能读到完整发布后的快照。发布成功后旧快照表
   与旧文件才被删除。
 - 快照支持 **JSON Lines（默认，零依赖）** 与 **Parquet（需 pyarrow）**。
 - **强制中止可重跑**：每读完一页进度即落盘，重跑时仍有效的分页从已保存进度续读；
   游标若已过期则按上面的 410 规则重读，已发布快照全程可读。
+
+### 诊断与强停对账（`diagnostics.py` / `selftest.py`）
+- 每个 HTTP 请求**发出前**先落一条 `inflight` 尝试记录（来源、阶段、端点、
+  请求参数、请求前续点），回包后再写结果与”进度是否已落盘”。
+- 同步进程正常结束登记 `completed`；被强停则运行记录停在 `running`。下一次
+  打开状态库（新一次 sync 或 `diagnose`）会按登记的 pid 是否存活对账：
+  属于已消失进程的 `inflight` 请求被标为**结果未知**，并保留请求前续点，
+  因此重跑后仍能查清”强停那次到底有没有落盘”。
+- 各来源当前阻塞位置单独记录在 `runtime` 表：等额度、冷却（含剩余时间）、
+  续令牌、等 HTTP 回包、处理回包、发布快照等；`diagnose` 在同步运行期间
+  也能读到这些状态。
+- **已结束请求最多保留最近 200 条**（`ATTEMPT_HISTORY_CAP`），按结束时间滚动
+  淘汰；当前 `inflight` 请求与 `progress` 表的各源续点不参与淘汰，始终可查。
+  策略/令牌等非数据来源的请求同样受上限约束，结果未知的旧尝试单独列全。
 
 ## 五、目录结构
 
@@ -121,10 +170,13 @@ crane_sync/
   mock_server.py  三个自带本地模拟 HTTP 数据源 + 网关额度/令牌/游标轮换
   fetchers.py     偏移/游标/时间窗三个采集器（分页、进度、发布）
   storage.py      SQLite 进度/暂存/原子发布，JSONL/Parquet 快照，合并读取
+  diagnostics.py  请求尝试日志、各源当前状态与本机诊断报告
+  selftest.py     内置模拟源一键验证等待/强停/续跑
   engine.py       异步并发编排三个来源
-  cli.py          serve / sync / read 命令行
+  cli.py          serve / sync / read / diagnose / selftest 命令行
 tests/
-  test_sync.py    14 项自动化测试（含真实子进程链路）
+  test_sync.py          14 项核心自动化测试（含真实子进程链路）
+  test_diagnostics.py   6 项诊断/上限/强停对账/一键自检测试
 run_tests.py      一键测试入口
 config.example.json
 requirements.txt
@@ -136,3 +188,5 @@ requirements.txt
 - `POST /mock/admin/rotate-cursor`：把游标清单轮换到新版，用于验证 410 重读。
 - `GET  /mock/admin/stats`：查看网关请求数、续期次数、429 次数等。
 - 启动参数 `--cursor-rotate-after N`：第 N 次游标调用后自动轮换清单。
+- 启动参数 `--response-delay 秒数`：每个数据响应人为延迟，用于演示在途请求与
+  强停（`selftest` 内部也用它制造真实的"等 HTTP 回包"）。

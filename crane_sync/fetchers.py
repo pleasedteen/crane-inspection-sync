@@ -7,10 +7,12 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable
 
+from .diagnostics import AttemptRecorder
 from .http import HttpClient
 from .limits import IndependentLimiter, SharedGateway
 from .models import InspectionOrder
@@ -30,6 +32,7 @@ class BaseFetcher:
         page_size: int = 10,
         snapshot_format: str = "jsonl",
         on_page: Callable[[str, int], Awaitable[None]] | None = None,
+        recorder: AttemptRecorder | None = None,
     ):
         self.storage = storage
         self.client = client
@@ -38,6 +41,7 @@ class BaseFetcher:
         self.snapshot_format = snapshot_format
         # 测试钩子：每处理完一页调用一次，便于做"中途中止"测试
         self.on_page = on_page
+        self.recorder = recorder
         self._position = 0
 
     async def _page_hook(self) -> None:
@@ -64,6 +68,62 @@ class BaseFetcher:
         """是否按来源清单行序维护 position（游标源必须为 True）。"""
         return False
 
+    async def _recorded_send(
+        self,
+        phase: str,
+        endpoint: str,
+        request_key: str,
+        detail: dict[str, Any] | None,
+        build: Callable[[str | None], Awaitable[dict]],
+    ) -> tuple[Callable[[str | None], Awaitable[dict]], dict[str, str | None]]:
+        """把一次真实 HTTP 调用包成带诊断记录的 send。
+
+        inflight 记录只在真正发出 HTTP 请求期间存在：等额度、冷却阶段
+        由 limits 探针单独标记，从而能区分"等额度/冷却"与"等回包"。
+        每次重试（429/401 后重发）都会各自留下一条尝试记录。
+        """
+        holder: dict[str, str | None] = {"attempt_id": None}
+
+        async def _send(token):
+            attempt_id = None
+            if self.recorder:
+                attempt_id = self.recorder.begin(
+                    self.name, phase, endpoint, request_key, detail
+                )
+            holder["attempt_id"] = attempt_id
+            try:
+                data = await build(token)
+            except asyncio.CancelledError:
+                # 被取消时无法确认服务端是否已处理，按"结果未知"落盘
+                if self.recorder:
+                    self.recorder.finish_error(
+                        attempt_id,
+                        "unknown",
+                        None,
+                        False,
+                        {"reason": "cancelled_inflight",
+                         "note": "请求在途被取消，无法确认服务端是否已处理"},
+                    )
+                raise
+            except BaseException as exc:
+                if self.recorder:
+                    outcome, status, confirmed, info = AttemptRecorder.classify(exc)
+                    self.recorder.finish_error(
+                        attempt_id, outcome, status, confirmed, info
+                    )
+                raise
+            if self.recorder:
+                self.recorder.finish_ok(
+                    attempt_id, detail={"response_bytes": len(str(data))}
+                )
+            return data
+
+        return _send, holder
+
+    def _record_progress(self, attempt_id: str | None, progress: dict) -> None:
+        if self.recorder:
+            self.recorder.mark_progress(attempt_id, self.name, progress)
+
     async def run(self) -> dict:  # pragma: no cover - 抽象方法
         raise NotImplementedError
 
@@ -88,22 +148,41 @@ class OffsetFetcher(BaseFetcher):
         else:
             offset = int(saved_offset)
         self._pages = 0
+        if self.recorder:
+            self.recorder.set_state(
+                self.name, "processing", phase="start", next_offset=offset
+            )
         logger.info("[offset] 从 offset=%s 开始（或续读）", offset)
         while True:
-            async def _send(token):
+            async def _send_request(token):
                 return await self.client.get(
                     f"{self.base_url}/offset/orders",
                     {"limit": self.page_size, "offset": offset},
                     token=token,
                 )
 
+            _send, holder = await self._recorded_send(
+                "paging",
+                "/offset/orders",
+                f"offset={offset}&limit={self.page_size}",
+                {"offset": offset, "page_size": self.page_size},
+                _send_request,
+            )
             data = await self.gateway.request(_send, owner=self.name)
             written = self._ingest(data.get("orders", []))
             offset = data["next_offset"]
             self._pages += 1
-            self.storage.set_progress(
-                self.name, {"next_offset": offset, "done": offset is None}
-            )
+            new_progress = {"next_offset": offset, "done": offset is None}
+            self.storage.set_progress(self.name, new_progress)
+            self._record_progress(holder["attempt_id"], new_progress)
+            if self.recorder:
+                self.recorder.set_state(
+                    self.name,
+                    "processing" if offset is not None else "publishing",
+                    phase="paging",
+                    page=self._pages,
+                    next_offset=offset,
+                )
             logger.info(
                 "[offset] 第 %s 页完成，本页写入 %s 条，下一页 offset=%s",
                 self._pages, written, offset,
@@ -111,6 +190,8 @@ class OffsetFetcher(BaseFetcher):
             await self._page_hook()
             if offset is None:
                 break
+        if self.recorder:
+            self.recorder.set_state(self.name, "publishing", phase="publish")
         info = self.storage.publish_snapshot(self.name, self.snapshot_format)
         logger.info("[offset] 已发布快照 %s（%s 条）", info["snapshot_id"],
                     info["record_count"])
@@ -146,13 +227,24 @@ class CursorFetcher(BaseFetcher):
         cursor = progress.get("next_cursor")  # None 表示从头开始
         self._pages = 0
         self._position = 0  # 每次完整重读都从清单第 0 行开始编号
+        if self.recorder:
+            self.recorder.set_state(
+                self.name, "processing", phase="start", next_cursor=cursor
+            )
         if cursor:
             logger.info("[cursor] 尝试从已保存游标续读: %s", cursor)
         else:
             logger.info("[cursor] 无有效游标，从清单开头读取")
 
         while True:
-            async def _send(token):
+            phase = "manifest" if cursor is None else "paging"
+            endpoint = "/cursor/manifest" if cursor is None else "/cursor/orders"
+            request_key = (
+                f"limit={self.page_size}" if cursor is None
+                else f"cursor={cursor}&limit={self.page_size}"
+            )
+
+            async def _send_request(token):
                 if cursor is None:
                     return await self._load_manifest(token)
                 return await self.client.get(
@@ -161,19 +253,32 @@ class CursorFetcher(BaseFetcher):
                     token=token,
                 )
 
+            _send, holder = await self._recorded_send(
+                phase,
+                endpoint,
+                request_key,
+                {"cursor": cursor},
+                _send_request,
+            )
             data = await self.gateway.request(_send, owner=self.name)
 
             # 清单入口响应
             if "entries" in data:
                 cursor = data["next_cursor"]
-                self.storage.set_progress(
-                    self.name,
-                    {
-                        "manifest_version": data["manifest_version"],
-                        "next_cursor": cursor,
-                        "done": False,
-                    },
-                )
+                new_progress = {
+                    "manifest_version": data["manifest_version"],
+                    "next_cursor": cursor,
+                    "done": False,
+                }
+                self.storage.set_progress(self.name, new_progress)
+                self._record_progress(holder["attempt_id"], new_progress)
+                if self.recorder:
+                    self.recorder.set_state(
+                        self.name,
+                        "processing",
+                        phase="manifest",
+                        manifest_version=data["manifest_version"],
+                    )
                 logger.info(
                     "[cursor] 取得清单 %s，%s 个条目，起始游标=%s",
                     data["manifest_version"], len(data["entries"]), cursor,
@@ -183,14 +288,21 @@ class CursorFetcher(BaseFetcher):
             written = self._ingest(data.get("orders", []))
             cursor = data.get("next_cursor")
             self._pages += 1
-            self.storage.set_progress(
-                self.name,
-                {
-                    "manifest_version": data["manifest_version"],
-                    "next_cursor": cursor,
-                    "done": cursor is None,
-                },
-            )
+            new_progress = {
+                "manifest_version": data["manifest_version"],
+                "next_cursor": cursor,
+                "done": cursor is None,
+            }
+            self.storage.set_progress(self.name, new_progress)
+            self._record_progress(holder["attempt_id"], new_progress)
+            if self.recorder:
+                self.recorder.set_state(
+                    self.name,
+                    "processing" if cursor is not None else "publishing",
+                    phase="paging",
+                    page=self._pages,
+                    next_cursor=cursor,
+                )
             logger.info(
                 "[cursor] 第 %s 页完成（清单 %s），写入 %s 条，下一游标=%s",
                 self._pages, data["manifest_version"], written, cursor,
@@ -199,6 +311,8 @@ class CursorFetcher(BaseFetcher):
             if cursor is None:
                 break
 
+        if self.recorder:
+            self.recorder.set_state(self.name, "publishing", phase="publish")
         info = self.storage.publish_snapshot(self.name, self.snapshot_format)
         logger.info("[cursor] 已发布快照 %s（%s 条）", info["snapshot_id"],
                     info["record_count"])
@@ -216,6 +330,10 @@ class CursorFetcher(BaseFetcher):
             # 新版清单记录集合可能变化，清掉旧暂存；已发布快照仍可读
             self.storage.clear_staging(self.name)
             self._position = 0
+            if self.recorder:
+                self.recorder.set_state(
+                    self.name, "processing", phase="reread_after_410"
+                )
             return await self._once()
 
 
@@ -254,22 +372,41 @@ class WindowFetcher(BaseFetcher):
         progress = self.storage.get_progress(self.name) or {}
         start = progress.get("last_to") or "2026-11-10T08:00:00"
         self._pages = 0
+        if self.recorder:
+            self.recorder.set_state(
+                self.name, "processing", phase="start", last_to=start
+            )
         logger.info("[window] 从时间窗起点 %s 开始（或续读）", start)
         while start <= self.horizon:
             end = self._add_minutes(start, self.window_minutes)
             frm, to = start, end
 
-            async def _send(_token, frm=frm, to=to):
+            async def _send_request(_token, frm=frm, to=to):
                 return await self.client.get(
                     f"{self.base_url}/window/orders", {"from": frm, "to": to}
                 )
 
+            _send, holder = await self._recorded_send(
+                "paging",
+                "/window/orders",
+                f"from={frm}&to={to}",
+                {"from": frm, "to": to},
+                _send_request,
+            )
             data = await self.limiter.request(_send, owner=self.name)
             written = self._ingest(data.get("orders", []))
             self._pages += 1
-            self.storage.set_progress(
-                self.name, {"last_to": to, "done": to >= self.horizon}
-            )
+            new_progress = {"last_to": to, "done": to >= self.horizon}
+            self.storage.set_progress(self.name, new_progress)
+            self._record_progress(holder["attempt_id"], new_progress)
+            if self.recorder:
+                self.recorder.set_state(
+                    self.name,
+                    "processing" if to < self.horizon else "publishing",
+                    phase="paging",
+                    page=self._pages,
+                    last_to=to,
+                )
             logger.info(
                 "[window] 窗口 [%s, %s] 完成，本页 %s 条，新增/更新 %s 条",
                 frm, to, data.get("count", 0), written,
@@ -277,6 +414,8 @@ class WindowFetcher(BaseFetcher):
             await self._page_hook()
             # 下一窗口与当前窗口首尾相接（闭区间天然重叠一条边界记录）
             start = end
+        if self.recorder:
+            self.recorder.set_state(self.name, "publishing", phase="publish")
         info = self.storage.publish_snapshot(self.name, self.snapshot_format)
         logger.info("[window] 已发布快照 %s（%s 条）", info["snapshot_id"],
                     info["record_count"])
