@@ -2,11 +2,13 @@
 
 职责：
 - 分页进度（中止重跑后续读）
-- 各来源暂存记录（按 来源+单号+修订号 去重）
+- 各来源暂存记录（按 来源+作业区+单号+修订号 去重）
 - 快照原子发布：先把完整快照写成不可见临时文件并 rename，
   再在一个数据库事务里切换"已发布"指针；读者只会看到完整快照。
 - 合并读取：每个来源只取其最新已发布快照，单号只保留最高修订。
 
+偏移源可以按作业区拆分：每个作业区有独立的分页进度和独立暂存行，
+但最终仍只发布一份 offset 快照（跨区按单号取最高修订）。
 快照文件格式支持 JSON Lines（零依赖）与 Parquet（需 pyarrow）。
 """
 from __future__ import annotations
@@ -20,6 +22,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .models import InspectionOrder
+
+# 偏移源各作业区的分页进度键前缀；旧单接口模式仍用 "offset"。
+OFFSET_ZONE_PROGRESS_PREFIX = "offset:zone:"
+OFFSET_ROUND_STATE_KEY = "offset_round"
+
+
+def zone_progress_key(zone: str) -> str:
+    return f"{OFFSET_ZONE_PROGRESS_PREFIX}{zone}"
 
 
 def _utcnow() -> str:
@@ -56,13 +66,14 @@ class Storage:
                 );
                 CREATE TABLE IF NOT EXISTS records(
                     source TEXT NOT NULL,
+                    zone TEXT NOT NULL DEFAULT '',
                     order_id TEXT NOT NULL,
                     revision INTEGER NOT NULL,
                     inspected_at TEXT NOT NULL,
                     gaps_json TEXT NOT NULL,
                     position INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL,
-                    PRIMARY KEY(source, order_id, revision)
+                    PRIMARY KEY(source, zone, order_id, revision)
                 );
                 CREATE TABLE IF NOT EXISTS publications(
                     source TEXT PRIMARY KEY,
@@ -83,6 +94,34 @@ class Storage:
             if "position" not in cols and "seq" not in cols:
                 self._conn.execute(
                     "ALTER TABLE records ADD COLUMN position INTEGER NOT NULL DEFAULT 0"
+                )
+            if "zone" not in cols:
+                # 旧表主键不含 zone，无法容纳同一单号出现在多个作业区；
+                # 重建表并把旧数据归入默认空作业区。
+                self._conn.executescript(
+                    """
+                    BEGIN;
+                    CREATE TABLE records_migrated(
+                        source TEXT NOT NULL,
+                        zone TEXT NOT NULL DEFAULT '',
+                        order_id TEXT NOT NULL,
+                        revision INTEGER NOT NULL,
+                        inspected_at TEXT NOT NULL,
+                        gaps_json TEXT NOT NULL,
+                        position INTEGER NOT NULL DEFAULT 0,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY(source, zone, order_id, revision)
+                    );
+                    INSERT INTO records_migrated(
+                        source,zone,order_id,revision,inspected_at,
+                        gaps_json,position,updated_at
+                    )
+                    SELECT source,'',order_id,revision,inspected_at,
+                           gaps_json,position,updated_at FROM records;
+                    DROP TABLE records;
+                    ALTER TABLE records_migrated RENAME TO records;
+                    COMMIT;
+                    """
                 )
 
     def close(self) -> None:
@@ -133,9 +172,12 @@ class Storage:
         orders: list[InspectionOrder],
         position_start: int = 0,
         track_position: bool = False,
+        zone: str = "",
     ) -> int:
         """写入暂存区。
 
+        zone 用于偏移源按作业区隔离暂存行：同一单号可以在不同作业区各存一份，
+        发布时再跨区按单号取最高修订。
         track_position=True 时，每条记录按其在清单中的行号写入 position，
         游标源重读新版清单即按新清单逐行覆盖顺序；
         track_position=False 时 position 恒为 0，按单号/修订排序即可。
@@ -156,6 +198,7 @@ class Storage:
                     o.order_id,
                     o.revision,
                     source,
+                    zone,
                     o.inspected_at,
                     json.dumps(o.gaps, ensure_ascii=False),
                     pos,
@@ -165,45 +208,76 @@ class Storage:
             )
         with self._lock:
             cur = self._conn.executemany(
-                "INSERT INTO records(order_id,revision,source,inspected_at,"
-                "gaps_json,position,updated_at) VALUES(?,?,?,?,?,?,?) "
-                "ON CONFLICT(source,order_id,revision) DO UPDATE SET "
+                "INSERT INTO records(order_id,revision,source,zone,inspected_at,"
+                "gaps_json,position,updated_at) VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(source,zone,order_id,revision) DO UPDATE SET "
                 "inspected_at=excluded.inspected_at, gaps_json=excluded.gaps_json, "
                 "position=CASE WHEN ?=1 THEN excluded.position ELSE records.position END, "
                 "updated_at=excluded.updated_at",
-                # 每条 8 个参数：7 个插入列 + 末尾 position 更新开关
+                # 每条 9 个参数：8 个插入列 + 末尾 position 更新开关
                 rows,
             )
             return cur.rowcount
 
-    def count_staging(self, source: str) -> int:
+    def count_staging(self, source: str, zone: str | None = None) -> int:
         with self._lock:
+            if zone is None:
+                return self._conn.execute(
+                    "SELECT COUNT(*) FROM records WHERE source=?", (source,)
+                ).fetchone()[0]
             return self._conn.execute(
-                "SELECT COUNT(*) FROM records WHERE source=?", (source,)
+                "SELECT COUNT(*) FROM records WHERE source=? AND zone=?",
+                (source, zone),
             ).fetchone()[0]
 
-    def clear_staging(self, source: str) -> None:
+    def clear_staging(self, source: str, zone: str | None = None) -> None:
         """清空某来源暂存区（已发布的快照表不受影响）。
 
+        zone 为 None 时清空该来源全部分区；指定 zone 时只清该作业区。
         游标清单整体过期、记录集合可能变化时，重读前调用，
         避免新版清单已删除的旧记录残留进新快照。
         """
         with self._lock:
-            self._conn.execute("DELETE FROM records WHERE source=?", (source,))
+            if zone is None:
+                self._conn.execute(
+                    "DELETE FROM records WHERE source=?", (source,)
+                )
+            else:
+                self._conn.execute(
+                    "DELETE FROM records WHERE source=? AND zone=?", (source, zone)
+                )
 
-    def _latest_revision_rows(self, source: str) -> list[dict]:
-        """发布投影：每个巡检单号只保留最高修订，并保持来源清单顺序。"""
+    def _projection_sql(self, source: str, zones: list[str] | None) -> tuple[str, list]:
+        """发布投影 SQL：单号只保留最高修订，可选限定作业区集合。"""
+        if zones is None:
+            where = "source=? AND zone=''"
+            params: list = [source]
+        elif not zones:
+            # 空集合：没有任何作业区参与发布，结果为空
+            where = "source=? AND 1=0"
+            params = [source]
+        else:
+            marks = ",".join("?" for _ in zones)
+            where = f"source=? AND zone IN ({marks})"
+            params = [source, *zones]
         sql = (
             "WITH ranked AS ("
             "SELECT order_id,revision,source,inspected_at,gaps_json,position,"
             "ROW_NUMBER() OVER ("
             "PARTITION BY order_id ORDER BY revision DESC) AS rn "
-            "FROM records WHERE source=?) "
-            "SELECT order_id,revision,source,inspected_at,gaps_json "
+            f"FROM records WHERE {where}) "
+            "SELECT order_id,revision,source,inspected_at,gaps_json,position "
             "FROM ranked WHERE rn=1 ORDER BY position, order_id"
         )
+        return sql, params
+
+    def latest_revision_rows(
+        self, source: str, zones: list[str] | None = None
+    ) -> list[dict]:
+        """发布投影：每个巡检单号只保留最高修订，并保持来源清单顺序。"""
+        sql, params = self._projection_sql(source, zones)
         with self._lock:
-            cur = self._conn.execute(sql, (source,))
+            cur = self._conn.execute(sql, params)
             return [
                 {
                     "order_id": r[0],
@@ -214,6 +288,9 @@ class Storage:
                 }
                 for r in cur.fetchall()
             ]
+
+    def _latest_revision_rows(self, source: str) -> list[dict]:
+        return self.latest_revision_rows(source, zones=None)
 
     # ---------- snapshot publish ----------
     def published_sources(self) -> list[str]:
@@ -287,31 +364,29 @@ class Storage:
             return str(final)
         raise ValueError(f"不支持的快照格式: {fmt}")
 
-    def publish_snapshot(self, source: str, fmt: str = "jsonl") -> dict:
+    def publish_snapshot(
+        self, source: str, fmt: str = "jsonl", zones: list[str] | None = None
+    ) -> dict:
         """发布某来源当前暂存区的完整快照（原子切换）。
 
         发布投影中每个巡检单号只保留最高修订（暂存区仍保留全量记录）。
+        zones 为 None 时只发布 ``zone=''`` 的旧单接口数据（历史行为）；
+        传入作业区列表时，把所列作业区的暂存数据合并成一份快照。
         """
-        rows = self._latest_revision_rows(source)
+        rows = self.latest_revision_rows(source, zones=zones)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
         snapshot_id = f"{stamp}_{random.getrandbits(24):06x}"
         table_name = f"snap_{source}_{snapshot_id}"
         file_path = self._write_snapshot_file(source, snapshot_id, rows, fmt)
+        projection_sql, projection_params = self._projection_sql(source, zones)
         with self._lock:
             old = self.latest_snapshot_info(source)
             self._conn.execute("BEGIN")
             try:
-                # 与 _latest_revision_rows 等价的 SQL：仅保留每单号最高修订
+                # 与 latest_revision_rows 等价的 SQL：仅保留每单号最高修订
                 self._conn.execute(
-                    f"CREATE TABLE {table_name} AS "
-                    "WITH ranked AS ("
-                    "SELECT order_id,revision,source,inspected_at,gaps_json,position,"
-                    "ROW_NUMBER() OVER ("
-                    "PARTITION BY order_id ORDER BY revision DESC) AS rn "
-                    "FROM records WHERE source=?) "
-                    "SELECT order_id,revision,source,inspected_at,gaps_json,position "
-                    "FROM ranked WHERE rn=1 ORDER BY position, order_id",
-                    (source,),
+                    f"CREATE TABLE {table_name} AS " + projection_sql,
+                    projection_params,
                 )
                 self._conn.execute(
                     "INSERT INTO publications(source,snapshot_id,snapshot_table,"

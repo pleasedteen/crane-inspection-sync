@@ -31,12 +31,33 @@ def _iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S")
 
 
+# 偏移源的作业区划分（模拟源固定四个区）
+OFFSET_ZONES = ("A", "B", "C", "D")
+
+# 跨区复检：同一单号在另一个作业区里有更高修订（单号本就属于别的区），
+# 用于验证撤区后按剩余区最高修订发布。
+# 键为追加到的作业区，值为 (单号序号, 追加修订号)。
+CROSS_ZONE_REVISIONS = {
+    # QC-0007 本属 C（最高 rev3），A 区另有一次 rev4 复检
+    "A": ((7, 4),),
+    # QC-0010 本属 D（最高 rev2），B 区另有一次 rev4 复检
+    "B": ((10, 4),),
+}
+
+
 def build_datasets(seed: int = 20261118) -> dict:
-    """生成三套数据集，单号/修订号在供应商之间共用。"""
+    """生成三套数据集，单号/修订号在供应商之间共用。
+
+    偏移源额外携带 ``zone`` 作业区字段，供按作业区拆分接口使用；
+    ``/offset/orders`` 不带 zone 参数时仍返回全部作业区（旧单接口行为）。
+    """
     base = datetime(2026, 11, 10, 8, 0, 0)
     all_orders: dict[str, list[dict]] = {}
+    zones_of: dict[str, str] = {}
     for i in range(1, 41):  # 40 个单号
         order_id = f"QC-{i:04d}"
+        # 偏移源每 3 个单号取 1 个，正好按序号均匀落到作业区
+        zones_of[order_id] = OFFSET_ZONES[(i // 3) % len(OFFSET_ZONES)]
         n_rev = 3 if i % 7 == 0 else (2 if i % 4 == 0 else 1)
         versions = []
         for rev in range(1, n_rev + 1):
@@ -70,6 +91,29 @@ def build_datasets(seed: int = 20261118) -> dict:
         return rows
 
     offset_rows = pick(3, 0)
+    for row in offset_rows:
+        # 只作用于偏移源，不改变游标/时间窗数据集
+        row["zone"] = zones_of[row["order_id"]]
+
+    # 跨区复检记录：用同一单号的更高修订，追加到指定作业区清单末尾
+    for zone, pairs in CROSS_ZONE_REVISIONS.items():
+        for order_no, revision in pairs:
+            order_id = f"QC-{order_no:04d}"
+            base_row = all_orders[order_id][-1]
+            extra = {
+                "order_id": order_id,
+                "revision": revision,
+                "inspected_at": base_row["inspected_at"],
+                "gaps": [
+                    {
+                        "point": "rail",
+                        "value": 8100 + order_no * 10 + revision,
+                        "unit": "um",
+                    }
+                ],
+                "zone": zone,
+            }
+            offset_rows.append(extra)
     cursor_rows = pick(3, 1)
     window_rows = pick(2, 0)
     return {
@@ -123,6 +167,60 @@ class GatewayState:
         self._cursor_rotate_after = cursor_rotate_after
         self.datasets = datasets
         self.stats = {"gateway_requests": 0, "renewals": 0, "rejected_429": 0}
+        # 按作业区统计偏移请求数，以及可选的慢区配置
+        self.zone_requests: dict[str, int] = {}
+        self.zone_delay: dict[str, float] = {}
+        # 偏移源请求明细：zone/offset/开始与完成时刻，供测试验证并发与续读
+        self.zone_request_log: list[dict] = []
+
+    @property
+    def zone_delay_config(self) -> dict[str, float]:
+        return self.zone_delay
+
+    @zone_delay_config.setter
+    def zone_delay_config(self, value: dict[str, float]) -> None:
+        with self._lock:
+            self.zone_delay = {
+                str(k): max(0.0, float(v)) for k, v in (value or {}).items()
+            }
+
+    def note_zone_request(self, zone: str) -> None:
+        with self._lock:
+            self.zone_requests[zone] = self.zone_requests.get(zone, 0) + 1
+
+    def log_zone_request(self, zone: str | None, offset: int) -> None:
+        with self._lock:
+            self.zone_request_log.append(
+                {
+                    "zone": zone,
+                    "offset": offset,
+                    "started": time.monotonic(),
+                }
+            )
+
+    def finish_zone_request(self, zone: str | None, offset: int) -> None:
+        with self._lock:
+            for rec in reversed(self.zone_request_log):
+                if rec["zone"] == zone and rec["offset"] == offset:
+                    rec["finished"] = time.monotonic()
+                    break
+
+    def reset_zone_log(self) -> None:
+        with self._lock:
+            self.zone_requests.clear()
+            self.zone_request_log.clear()
+
+    def apply_zone_delay(self, zone: str | None) -> None:
+        if not zone:
+            return
+        with self._lock:
+            delay = self.zone_delay.get(zone, 0.0)
+        if delay > 0:
+            time.sleep(delay)
+
+    def reset_zone_requests(self) -> None:
+        with self._lock:
+            self.zone_requests.clear()
 
     def _build_cursor_manifest(self, rows: list[dict], version: int) -> list[dict]:
         if version == 1:
@@ -290,15 +388,24 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._gateway_authorized():
             return
         rows = self.state.gateway.datasets["offset"]
+        zone = qs.get("zone")
+        if zone:
+            self.state.gateway.note_zone_request(zone)
+            rows = [r for r in rows if r.get("zone") == zone]
         limit = int(qs.get("limit", 10))
         offset = int(qs.get("offset", 0))
         page = rows[offset : offset + limit]
+        # 模拟慢作业区：回包前阻塞，验证其他区照常推进
+        self.state.gateway.log_zone_request(zone, offset)
+        self.state.gateway.apply_zone_delay(zone)
+        self.state.gateway.finish_zone_request(zone, offset)
         self._send_json(
             200,
             {
                 "orders": page,
                 "next_offset": offset + limit if offset + limit < len(rows) else None,
                 "total": len(rows),
+                "zone": zone,
             },
         )
 
@@ -412,11 +519,20 @@ class MockServer(ThreadingHTTPServer):
 
     def admin_stats(self) -> dict:
         ds = self.gateway.datasets
+        with self.gateway._lock:
+            zone_requests = dict(self.gateway.zone_requests)
+            zone_log = list(self.gateway.zone_request_log)
         return {
             "gateway": self.gateway.stats,
             "window_rejected_429": self.window_rejected,
             "dataset_sizes": {k: len(v) for k, v in ds.items()},
             "cursor_version": self.gateway.cursor_version,
+            "offset_zone_requests": zone_requests,
+            "offset_zone_request_log": zone_log,
+            "offset_zone_sizes": {
+                z: sum(1 for r in ds["offset"] if r.get("zone") == z)
+                for z in OFFSET_ZONES
+            },
         }
 
 

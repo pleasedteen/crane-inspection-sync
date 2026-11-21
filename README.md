@@ -19,9 +19,11 @@
 python3 run_tests.py
 ```
 
-实测约 22 秒完成 14 项测试，覆盖：毫米/微米归一、三源端到端发布、共享额度与
+实测约 39 秒完成 23 项测试，覆盖：毫米/微米归一、三源端到端发布、共享额度与
 令牌只续期一次、游标清单过期重读且旧快照可读、时间窗边界去重、强制中止后续跑、
-并发公平性、Parquet（有 pyarrow 时）以及真实子进程的 serve→sync→read 链路。
+并发公平性、Parquet（有 pyarrow 时）、真实子进程的 serve→sync→read 链路，以及
+偏移源**按作业区拆分**（拆区并发、慢区不阻塞、强杀续跑、增删区、撤区后按剩余区
+最高修订发布、改配增量暂存）。
 
 也可用标准 unittest：
 
@@ -41,7 +43,7 @@ python3 -m crane_sync serve --config-out mock.json --state-dir ./state --port 87
 
 | 来源 | 接口 | 分页方式 | 鉴权/额度 |
 |------|------|----------|-----------|
-| 偏移源 | `GET /offset/orders?limit=&offset=` | 偏移 | 共享网关令牌+额度 |
+| 偏移源 | `GET /offset/orders?limit=&offset=[&zone=]` | 偏移（可带作业区） | 共享网关令牌+额度 |
 | 游标源 | `GET /cursor/manifest`、`GET /cursor/orders?cursor=` | 清单游标 | 共享网关令牌+额度 |
 | 时间窗源 | `GET /window/orders?from=&to=` | 时间窗 | 独立额度，无令牌 |
 | 令牌 | `POST /gateway/token` | — | 续期同样占额度 |
@@ -49,15 +51,23 @@ python3 -m crane_sync serve --config-out mock.json --state-dir ./state --port 87
 `--config-out` 会把连接参数写成 `mock.json`，供下一步使用。该命令常驻，
 另开终端执行后续步骤；按 `Ctrl+C` 停止。
 
+可选 `--offset-zones A,B,C` 会把作业区列表写入配置文件（模拟源的偏移数据固定
+分为 A/B/C/D 四个作业区）。
+
 ### 2) 执行一轮同步并发布快照
 
 ```bash
 python3 -m crane_sync sync --config mock.json
+# 按作业区拆分偏移源（可在命令行覆盖，也可写进配置文件的 offset_zones）：
+python3 -m crane_sync sync --config mock.json --offset-zones A,B,C,D
 # 可选：--format parquet（需 pyarrow）、--state-dir 覆盖目录、-v 详细日志
 ```
 
 每个来源读完整轮清单后**独立发布**一次原子快照，结尾打印各来源快照 ID、格式、
-记录数与文件路径。
+记录数与文件路径。偏移源按作业区拆分时，仍是**一份 offset 快照**（不是每区一份），
+结尾会额外打印每个作业区是“采了几页”还是“已采齐跳过”。
+不带 `--offset-zones` / 配置无 `offset_zones` 时，沿用旧单接口（不带 `zone` 参数），
+行为与历史完全一致。
 
 ### 3) 读取已发布快照
 
@@ -86,10 +96,30 @@ python3 -m crane_sync read --state-dir ./state --source offset
 
 ### 三种分页
 - **偏移源**：进度就是下一页 `offset`，每页落盘。
+  - **可按作业区拆分**（见下节）：每个区独立进度、独立暂存分区，
+    全部分区采齐后仍只发布一份 offset 快照。
 - **游标源**：游标绑定清单版次。清单过期后旧游标返回 HTTP 410，客户端丢弃旧
   进度、清空该源旧暂存、从新版清单开头重读；新版清单的记录集合与顺序都可能变化，
   快照按清单行号（`position` 列）保序。**重读期间上一版已发布快照仍可正常读取**。
 - **时间窗源**：进度记录最后一个窗口的 `to`，重跑从此处继续。
+
+### 偏移源按作业区拆分（`fetchers.py` / `engine.py`）
+在配置里写 `"offset_zones": ["A", "B", "C", "D"]`（或 `sync --offset-zones A,B,C,D`）：
+
+- **一份快照**：每个区是独立异步任务，但全部采齐后由引擎统一发布**一份**
+  offset 快照；快照内同一单号只保留最高修订（可能来自不同作业区）。
+- **并发与共享**：各区请求仍走**同一个网关额度与同一令牌**。某个区等待回包或
+  冷却时，其他区照常拿额度推进（模拟源可用 `zone_delay` 拖慢指定区来演示）。
+- **强杀续跑**：每区每页进度独立落盘（`offset:zone:<区>`）。强制中止后重跑，
+  已采齐的区零请求直接跳过，未采完的区沿原进度续读。
+- **增删作业区**：
+  - 新增区：只为新区从头采集，已采齐区零请求；暂存占用只随新区数据量增长；
+  - 撤下区：该区移出本轮参与发布的集合，其进度与暂存一并释放，不进入新快照；
+    同一单号回落到**剩余作业区中的最高修订**发布。
+- **轮次规则**：上一轮已完整发布且配置的作业区集合不变时，开启全新一轮全部重采；
+  否则（强杀续跑、增删区）延续本轮，保留已采齐区。
+- **兼容旧配置**：不配置 `offset_zones` 时完全沿用旧单接口（请求不带 `zone`，
+  进度键仍为 `offset`），本功能不改变旧行为。
 
 ### 额度、冷却与令牌（`limits.py`）
 - 偏移源与游标源**共用**同一网关的滑动窗口额度和同一访问令牌；数据请求与令牌
@@ -103,10 +133,11 @@ python3 -m crane_sync read --state-dir ./state --source offset
 
 ### 快照与可恢复性（`storage.py`）
 - 状态存于 `state/sync_state.db`（SQLite，WAL 模式）：分页进度、暂存记录、已发布
-  指针与快照表。
+  指针与快照表。暂存表主键为 `(来源, 作业区, 单号, 修订号)`；旧库启动时自动迁移，
+  历史记录归入空作业区。
 - **原子发布**：先把完整快照写到不可见临时文件并 `os.replace` 改名，再在一个 DB
   事务里切换“已发布”指针；维保人员只能读到完整发布后的快照。发布成功后旧快照表
-  与旧文件才被删除。
+  与旧文件才被删除。本轮全部采齐前，上一版快照照常可读。
 - 快照支持 **JSON Lines（默认，零依赖）** 与 **Parquet（需 pyarrow）**。
 - **强制中止可重跑**：每读完一页进度即落盘，重跑时仍有效的分页从已保存进度续读；
   游标若已过期则按上面的 410 规则重读，已发布快照全程可读。
@@ -134,5 +165,9 @@ requirements.txt
 
 - `POST /mock/admin/expire-token`：强制当前令牌立即失效，用于验证 401 续期。
 - `POST /mock/admin/rotate-cursor`：把游标清单轮换到新版，用于验证 410 重读。
-- `GET  /mock/admin/stats`：查看网关请求数、续期次数、429 次数等。
+- `GET  /mock/admin/stats`：查看网关请求数、续期次数、429 次数、按作业区的请求数
+  与请求明细（`offset_zone_requests` / `offset_zone_request_log`）等。
 - 启动参数 `--cursor-rotate-after N`：第 N 次游标调用后自动轮换清单。
+- 偏移源支持 `zone=A|B|C|D`；不带 `zone` 返回全部区（旧单接口）。
+  `MockServer.gateway.zone_delay_config = {"A": 0.4}` 可拖慢指定区回包，
+  用于演示“慢区等回包时其他区照常采集”。

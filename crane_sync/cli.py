@@ -45,29 +45,30 @@ def cmd_serve(args) -> int:
     host, port = server.server_address
     base_url = f"http://{host}:{port}"
     print(f"模拟数据源已启动: {base_url}", flush=True)
-    print("  偏移源    GET /offset/orders?limit=&offset=", flush=True)
+    print("  偏移源    GET /offset/orders?limit=&offset=[&zone=A|B|C]", flush=True)
     print("  游标源    GET /cursor/manifest, /cursor/orders?cursor=", flush=True)
     print("  时间窗源  GET /window/orders?from=&to=", flush=True)
     print("  令牌      POST /gateway/token", flush=True)
     if args.config_out:
+        cfg = {
+            "base_url": base_url,
+            "state_dir": args.state_dir,
+            "snapshot_format": args.format,
+            "page_size": args.page_size,
+            "gateway_quota": args.gateway_quota,
+            "gateway_window": args.gateway_window,
+            "window_source_quota": args.window_quota,
+            "window_source_window": args.window_window,
+            "cooldown_seconds": 0.5,
+            "window_minutes": 30,
+            "window_horizon": "2026-11-12T00:00:00",
+        }
+        if args.offset_zones:
+            cfg["offset_zones"] = [
+                z.strip() for z in args.offset_zones.split(",") if z.strip()
+            ]
         Path(args.config_out).write_text(
-            json.dumps(
-                {
-                    "base_url": base_url,
-                    "state_dir": args.state_dir,
-                    "snapshot_format": args.format,
-                    "page_size": args.page_size,
-                    "gateway_quota": args.gateway_quota,
-                    "gateway_window": args.gateway_window,
-                    "window_source_quota": args.window_quota,
-                    "window_source_window": args.window_window,
-                    "cooldown_seconds": 0.5,
-                    "window_minutes": 30,
-                    "window_horizon": "2026-11-12T00:00:00",
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
+            json.dumps(cfg, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         print(f"同步配置已写入: {args.config_out}", flush=True)
@@ -100,6 +101,9 @@ def cmd_sync(args) -> int:
         "snapshot_format": args.format,
     }
     config = _load_config(args.config, overrides)
+    if args.offset_zones is not None:
+        zones = tuple(z.strip() for z in args.offset_zones.split(",") if z.strip())
+        config.offset_zones = zones
     engine = SyncEngine(config)
     try:
         try:
@@ -116,6 +120,14 @@ def cmd_sync(args) -> int:
             f"格式={info['format']} 记录数={info['record_count']} "
             f"文件={info['file_path']}"
         )
+        zones = info.get("zones") if isinstance(info, dict) else None
+        if zones:
+            for zone, zr in sorted(zones.items()):
+                state = "已采齐跳过" if zr.get("skipped") else f"{zr.get('pages')} 页"
+                print(
+                    f"          作业区 {zone}: {state}，"
+                    f"暂存 {zr.get('staged')} 条"
+                )
     return 0
 
 
@@ -162,12 +174,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--window-window", type=float, default=5.0)
     p_serve.add_argument("--token-ttl", type=float, default=300.0)
     p_serve.add_argument("--cursor-rotate-after", type=int, default=None)
+    p_serve.add_argument(
+        "--offset-zones",
+        default=None,
+        help="写入配置的偏移源作业区，逗号分隔，如 A,B,C",
+    )
     p_serve.set_defaults(func=cmd_serve)
 
     p_sync = sub.add_parser("sync", help="执行一轮同步并发布各来源快照")
     p_sync.add_argument("--config", required=True)
     p_sync.add_argument("--state-dir", default=None)
     p_sync.add_argument("--format", default=None, choices=["jsonl", "parquet"])
+    p_sync.add_argument(
+        "--offset-zones",
+        default=None,
+        help="按作业区拆分偏移源，逗号分隔，如 A,B,C；留空沿用旧单接口",
+    )
     p_sync.add_argument("-v", "--verbose", action="store_true")
     p_sync.set_defaults(func=cmd_sync)
 

@@ -4,21 +4,24 @@
 - 三个来源作为独立 asyncio 任务并发推进；某个来源等待响应或冷却时，
   其他可请求的来源照常拿额度推进。
 - 每个来源读完自己的完整一轮清单后独立发布快照。
+- 偏移源可按作业区拆分：每个区一个任务，共享原网关额度/令牌；
+  全部区采齐后仍只发布一份 offset 快照。
 - 支持外部中止（AbortSync）：已落盘的分页进度保留，重跑续读。
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
 
 from .fetchers import CursorFetcher, OffsetFetcher, WindowFetcher
 from .http import HttpClient
 from .limits import CooldownGate, IndependentLimiter, SharedGateway, WindowQuota
-from .storage import Storage
+from .storage import OFFSET_ROUND_STATE_KEY, Storage, zone_progress_key
 
 logger = logging.getLogger("crane_sync")
 
@@ -41,7 +44,19 @@ class SyncConfig:
     window_minutes: int = 30
     window_horizon: str = "2026-11-12T00:00:00"
     sources: tuple[str, ...] = ("offset", "cursor", "window")
+    # 偏移源作业区列表；留空即使用旧单接口（不带 zone 参数）
+    offset_zones: tuple[str, ...] = ()
     on_page: Callable[[str, int], Awaitable[None]] | None = None
+
+    def __post_init__(self) -> None:
+        # 允许从 JSON 传入列表，也容忍 "A,B,C" 这样的字符串
+        self.sources = tuple(self.sources)
+        zones = self.offset_zones or ()
+        if isinstance(zones, str):
+            zones = zones.split(",")
+        self.offset_zones = tuple(
+            str(z).strip() for z in zones if str(z).strip()
+        )
 
 
 class SyncEngine:
@@ -93,18 +108,29 @@ class SyncEngine:
                 await self.gateway.cooldown.cooldown(exc.retry_after)
                 await self.gateway.quota.acquire(("token", "retry"))
 
-    def _build_fetchers(self):
+    def _build_fetchers(self) -> dict[str, object]:
         cfg = self.config
         common = dict(
             page_size=cfg.page_size,
             snapshot_format=cfg.snapshot_format,
             on_page=cfg.on_page,
         )
-        fetchers = {}
+        fetchers: dict[str, object] = {}
         if "offset" in cfg.sources:
-            fetchers["offset"] = OffsetFetcher(
-                self.storage, self.client, cfg.base_url, self.gateway, **common
-            )
+            if cfg.offset_zones:
+                for zone in cfg.offset_zones:
+                    fetchers[f"offset:{zone}"] = OffsetFetcher(
+                        self.storage,
+                        self.client,
+                        cfg.base_url,
+                        self.gateway,
+                        zone=zone,
+                        **common,
+                    )
+            else:
+                fetchers["offset"] = OffsetFetcher(
+                    self.storage, self.client, cfg.base_url, self.gateway, **common
+                )
         if "cursor" in cfg.sources:
             fetchers["cursor"] = CursorFetcher(
                 self.storage, self.client, cfg.base_url, self.gateway, **common
@@ -121,7 +147,96 @@ class SyncEngine:
             )
         return fetchers
 
+    # ---------- 偏移源作业区轮次 ----------
+    def _load_round(self) -> dict | None:
+        raw = self.storage.get_state(OFFSET_ROUND_STATE_KEY)
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict) or "zones" not in data:
+            return None
+        return data
+
+    def _save_round(self, data: dict) -> None:
+        self.storage.set_state(
+            OFFSET_ROUND_STATE_KEY, json.dumps(data, ensure_ascii=False)
+        )
+
+    def _prepare_offset_round(self) -> list[str]:
+        """确定本轮参与发布的作业区，并只重置真正需要重采的区。
+
+        语义：
+        - 上一轮已完整发布，且配置的作业区集合不变 → 开启全新一轮，
+          清空这些区的进度与暂存，全部重采；
+        - 其余情况（强杀后续跑 / 增删作业区）→ 延续本轮：
+          已采齐的区保留进度与暂存（零请求），未采完的沿原进度续读；
+          新增区清掉旧痕迹后从头采集；撤下的区移出本轮并释放暂存。
+        """
+        cfg_zones = list(self.config.offset_zones)
+        rnd = self._load_round()
+        if rnd is None:
+            for zone in cfg_zones:
+                self.storage.reset_progress(zone_progress_key(zone))
+                self.storage.clear_staging("offset", zone=zone)
+            self._save_round({"zones": cfg_zones, "published": False})
+            return cfg_zones
+
+        prev_zones = list(rnd.get("zones", []))
+        if rnd.get("published") and set(prev_zones) == set(cfg_zones):
+            # 周期性的全新一轮
+            for zone in cfg_zones:
+                self.storage.reset_progress(zone_progress_key(zone))
+                self.storage.clear_staging("offset", zone=zone)
+            self._save_round({"zones": cfg_zones, "published": False})
+            return cfg_zones
+
+        added = [z for z in cfg_zones if z not in prev_zones]
+        removed = [z for z in prev_zones if z not in cfg_zones]
+        for zone in added:
+            # 新加入本轮的区必须从头采集
+            self.storage.reset_progress(zone_progress_key(zone))
+            self.storage.clear_staging("offset", zone=zone)
+        for zone in removed:
+            # 撤下的区不再参与发布，释放其暂存占用
+            self.storage.reset_progress(zone_progress_key(zone))
+            self.storage.clear_staging("offset", zone=zone)
+        self._save_round({"zones": cfg_zones, "published": False})
+        logger.info(
+            "[offset] 延续本轮作业区（保留=%s 新增=%s 撤下=%s）",
+            [z for z in cfg_zones if z not in added],
+            added,
+            removed,
+        )
+        return cfg_zones
+
+    def _publish_offset_zones(self, zone_results: dict[str, dict]) -> dict:
+        """所有区采齐后统一发布一份 offset 快照。
+
+        使用本轮参与发布的作业区集合：撤下的区即使暂存残留也不进入快照；
+        快照内同一单号按剩余区的最高修订折叠，间隙已是毫米。
+        """
+        rnd = self._load_round() or {"zones": []}
+        zones = list(rnd.get("zones", []))
+        info = self.storage.publish_snapshot(
+            "offset", self.config.snapshot_format, zones=zones
+        )
+        self._save_round({**rnd, "published": True})
+        logger.info(
+            "[offset] 作业区 %s 全部采齐，已发布统一快照 %s（%s 条）",
+            ",".join(zones) or "（无）", info["snapshot_id"],
+            info["record_count"],
+        )
+        info = dict(info)
+        info["zones"] = zone_results
+        return info
+
     async def run(self) -> dict[str, dict]:
+        zone_mode = bool(self.config.offset_zones) and "offset" in self.config.sources
+        if zone_mode:
+            self._prepare_offset_round()
         fetchers = self._build_fetchers()
         results: dict[str, dict] = {}
         tasks = {
@@ -134,19 +249,33 @@ class SyncEngine:
                 done, pending = await asyncio.wait(
                     pending, return_when=asyncio.FIRST_EXCEPTION
                 )
+                first_exc: BaseException | None = None
                 for task in done:
                     name = task.get_name().removeprefix("fetch-")
                     exc = task.exception()
                     if exc is not None:
-                        # 任一来源失败/中止：取消其他仍在等待的来源
-                        for t in pending:
-                            t.cancel()
-                        if pending:
-                            await asyncio.gather(*pending, return_exceptions=True)
-                        raise exc
+                        # 先记下错误，继续取完其余已完成任务的结果/异常，
+                        # 避免"Task exception was never retrieved"告警
+                        if first_exc is None:
+                            first_exc = exc
+                        continue
                     results[name] = task.result()
+                if first_exc is not None:
+                    # 任一来源失败/中止：取消其他仍在等待的来源
+                    for t in pending:
+                        t.cancel()
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                    raise first_exc
         finally:
             self._executor.shutdown(wait=False)
+        if zone_mode:
+            zone_results = {
+                name.removeprefix("offset:"): results.pop(name)
+                for name in list(results)
+                if name.startswith("offset:")
+            }
+            results["offset"] = self._publish_offset_zones(zone_results)
         return results
 
     def close(self) -> None:
