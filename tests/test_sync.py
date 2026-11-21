@@ -251,7 +251,9 @@ class EndToEndTests(unittest.TestCase):
 
         async def abort_hook(source: str, pages: int):
             page_log[source] = pages
-            if sum(page_log.values()) >= 4:
+            # 确保偏移源至少落盘一页后再中止，断言才有意义
+            # （其他来源推进更快时，不能先被它们的页数触发）
+            if page_log.get("offset", 0) >= 1 and sum(page_log.values()) >= 4:
                 raise AbortSync("模拟强制中止")
 
         cfg = make_config(self.base_url, self.state_dir, on_page=abort_hook)
@@ -482,6 +484,41 @@ class EndToEndTests(unittest.TestCase):
             tmp.cleanup()
 
 
+class SnapshotBatchingTests(unittest.TestCase):
+    """快照分批归档必须与一次性折叠结果完全一致。"""
+
+    def test_batched_publish_keeps_every_order_with_many_revisions(self):
+        # 30 个单号 x 12 个修订，批大小小于单号数/修订数，
+        # 覆盖"同一单号多条修订跨批"的边界
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(tmp)
+            try:
+                for rev in range(1, 13):
+                    storage.upsert_records(
+                        "offset",
+                        [
+                            InspectionOrder(
+                                f"QC-{i:04d}", rev, "offset", "2026-11-10T08:00:00",
+                                [{"point": "rail", "value_mm": float(rev), "unit": "mm"}],
+                            )
+                            for i in range(30)
+                        ],
+                    )
+                for batch in (1, 4, 7, 200):
+                    info = storage.publish_snapshot("offset", "jsonl", batch)
+                    rows = storage.read_snapshot("offset")
+                    self.assertEqual(info["record_count"], 30, f"batch={batch}")
+                    self.assertEqual(len(rows), 30, f"batch={batch}")
+                    self.assertEqual(
+                        {r["order_id"] for r in rows},
+                        {f"QC-{i:04d}" for i in range(30)},
+                    )
+                    # 每个单号只保留最高修订
+                    self.assertEqual({r["revision"] for r in rows}, {12})
+            finally:
+                storage.close()
+
+
 class SubprocessCliTests(unittest.TestCase):
     """用启动脚本跑真实子进程：serve -> sync -> read。"""
 
@@ -535,6 +572,330 @@ class SubprocessCliTests(unittest.TestCase):
                     serve.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     serve.kill()
+                serve.stdout.close()
+                serve.stderr.close()
+
+    def test_cli_bulk_body_serve_sync_read(self):
+        """内置模拟源直接提供同秒 128 MiB 大正文，命令行全链路可跑通。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "mock.json"
+            state_dir = Path(tmp) / "state"
+            env = dict(os.environ, PYTHONPATH=str(ROOT))
+            serve = subprocess.Popen(
+                [
+                    sys.executable, "-m", "crane_sync", "serve",
+                    "--config-out", str(cfg_path),
+                    "--state-dir", str(state_dir),
+                    "--offset-bulk-count", "128",
+                    "--offset-record-bytes", str(128 * 1024),
+                    "--stream-chunk", "8",
+                    "--gateway-quota", "2000",
+                    "--window-quota", "2000",
+                ],
+                cwd=str(ROOT),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                deadline = time.time() + 10
+                while not cfg_path.exists() and time.time() < deadline:
+                    time.sleep(0.05)
+                self.assertTrue(cfg_path.exists(), "模拟源未及时写出配置")
+                # 大正文需要的页大小比默认配置大，覆盖为一次读完整轮
+                raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+                raw.update(page_size=128)
+                cfg_path.write_text(
+                    json.dumps(raw, ensure_ascii=False), encoding="utf-8"
+                )
+
+                sync = subprocess.run(
+                    [sys.executable, "-m", "crane_sync", "sync",
+                     "--config", str(cfg_path)],
+                    cwd=str(ROOT), env=env, text=True,
+                    capture_output=True, timeout=120,
+                )
+                self.assertEqual(sync.returncode, 0, sync.stderr)
+                self.assertIn("offset", sync.stdout)
+                read = subprocess.run(
+                    [sys.executable, "-m", "crane_sync", "read",
+                     "--state-dir", str(state_dir), "--source", "offset"],
+                    cwd=str(ROOT), env=env, text=True,
+                    capture_output=True, timeout=30,
+                )
+                self.assertEqual(read.returncode, 0, read.stderr)
+                self.assertIn("共 128 张巡检单", read.stdout)
+                self.assertIn("BULK-00000", read.stdout)
+            finally:
+                serve.terminate()
+                try:
+                    serve.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    serve.kill()
+                serve.stdout.close()
+                serve.stderr.close()
+
+
+
+# ----------------------------------------------------------------------
+# 大正文（同一秒集中到达）与来源隔离
+# ----------------------------------------------------------------------
+BULK_TARGET_BYTES = 128 * 1024 * 1024
+BULK_RECORDS = 1024
+
+
+class BulkBodyTests(unittest.TestCase):
+    """默认 JSON Lines 同步 128 MiB 同秒正文，峰值 RSS 增量 ≤ 64 MiB。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = start_server(
+            offset_bulk_count=BULK_RECORDS,
+            offset_record_bytes=BULK_TARGET_BYTES // BULK_RECORDS,
+            stream_chunk=8,
+        )
+        cls.base_url = (
+            f"http://{cls.server.server_address[0]}:{cls.server.server_address[1]}"
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+
+    def _config(self, state_dir: str, mode: str) -> dict:
+        return {
+            "mode": mode,
+            "base_url": self.base_url,
+            "state_dir": state_dir,
+            "page_size": BULK_RECORDS,
+            "gateway_quota": 100000,
+            "gateway_window": 1.0,
+            "window_source_quota": 100000,
+            "window_source_window": 1.0,
+            "snapshot_format": "jsonl",
+            "sources": [] if mode == "idle" else ["offset"],
+        }
+
+    def _run_probe(self, cfg: dict) -> dict:
+        proc = subprocess.run(
+            [sys.executable, str(ROOT / "tests" / "_sync_probe.py"),
+             json.dumps(cfg)],
+            cwd=str(ROOT),
+            env=dict(os.environ, PYTHONPATH=str(ROOT)),
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+
+    def test_peak_rss_bounded_for_128mib_page(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            idle = self._run_probe(self._config(str(Path(tmp) / "idle"), "idle"))
+            full = self._run_probe(self._config(str(Path(tmp) / "sync"), "sync"))
+        self.assertEqual(full["results"]["offset"]["record_count"], BULK_RECORDS)
+        delta = full["hwm"] - idle["hwm"]
+        self.assertLessEqual(
+            delta,
+            64 * 1024 * 1024,
+            f"同步端峰值 RSS 增量 {delta / 2**20:.1f} MiB 超过 64 MiB",
+        )
+
+    def test_bulk_snapshot_content_complete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            full = self._run_probe(self._config(tmp, "sync"))
+            info = full["results"]["offset"]
+            path = Path(info["file_path"])
+            self.assertTrue(path.exists())
+            lines = path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), BULK_RECORDS)
+            first = json.loads(lines[0])
+            self.assertEqual(first["source"], "offset")
+            self.assertGreater(len(first["gaps"]), 0)
+            # 同一秒集中到达：所有正文的时间戳相同
+            stamps = {json.loads(line)["inspected_at"] for line in lines}
+            self.assertEqual(len(stamps), 1)
+            # 快照记录数与发布元数据一致
+            storage = Storage(tmp)
+            try:
+                self.assertEqual(
+                    len(storage.read_snapshot("offset")), BULK_RECORDS
+                )
+            finally:
+                storage.close()
+
+
+class SourceIsolationTests(unittest.TestCase):
+    """一个来源写快照卡住时，其他来源仍能落盘并独立发布。"""
+
+    def setUp(self):
+        self.server = start_server()
+        self.base_url = (
+            f"http://{self.server.server_address[0]}:{self.server.server_address[1]}"
+        )
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state_dir = self.tmp.name
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.tmp.cleanup()
+
+    def test_stuck_publish_does_not_block_other_sources(self):
+        import threading
+
+        stuck = threading.Event()
+        release = threading.Event()
+        published_at: dict[str, float] = {}
+        start = time.monotonic()
+
+        def publish_hook(source: str) -> None:
+            if source == "offset":
+                stuck.set()
+                release.wait(15)
+            published_at[source] = time.monotonic() - start
+
+        cfg = make_config(
+            self.base_url, self.state_dir, publish_hook=publish_hook
+        )
+        engine = SyncEngine(cfg)
+        result: dict = {}
+
+        def run() -> None:
+            try:
+                result["value"] = asyncio.run(engine.run())
+            finally:
+                engine.close()
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        try:
+            self.assertTrue(stuck.wait(15), "offset 未进入发布阶段")
+            # offset 卡住期间，另外两个来源必须完成落盘并各自发布
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                storage = Storage(self.state_dir)
+                try:
+                    published = storage.published_sources()
+                    progress = {
+                        name: storage.get_progress(name)
+                        for name in ("cursor", "window")
+                    }
+                finally:
+                    storage.close()
+                if set(published) == {"cursor", "window"}:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(set(published), {"cursor", "window"})
+            for name, prog in progress.items():
+                self.assertIsNotNone(prog, f"{name} 没有落盘进度")
+                self.assertTrue(prog.get("done"), f"{name} 未读完")
+            # 卡住的来源在此期间确实没有发布，其他来源则各自按时发布
+            self.assertNotIn("offset", published_at)
+            self.assertLess(published_at["cursor"], 10)
+            self.assertLess(published_at["window"], 10)
+            storage = Storage(self.state_dir)
+            try:
+                # 其他来源的快照内容完整，可独立读取
+                self.assertTrue(storage.read_snapshot("cursor"))
+                self.assertTrue(storage.read_snapshot("window"))
+                with self.assertRaises(RuntimeError):
+                    storage.read_snapshot("offset")
+            finally:
+                storage.close()
+        finally:
+            release.set()
+            worker.join(30)
+        self.assertFalse(worker.is_alive(), "同步线程未在放行后结束")
+        self.assertEqual(
+            set(result["value"]), {"offset", "cursor", "window"}
+        )
+        # 放行后 offset 也完成发布，且发布时间明显晚于其他来源
+        storage = Storage(self.state_dir)
+        try:
+            self.assertTrue(storage.read_snapshot("offset"))
+            stamps = {
+                name: storage.latest_snapshot_info(name)["published_at"]
+                for name in ("offset", "cursor", "window")
+            }
+        finally:
+            storage.close()
+        self.assertGreater(stamps["offset"], stamps["cursor"])
+        self.assertGreater(stamps["offset"], stamps["window"])
+
+
+class AbortRecoveryTests(unittest.TestCase):
+    """中止后续读：已发布快照可读，重跑补全且结果与一次跑完一致。"""
+
+    def setUp(self):
+        self.server = start_server()
+        self.base_url = (
+            f"http://{self.server.server_address[0]}:{self.server.server_address[1]}"
+        )
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state_dir = self.tmp.name
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.tmp.cleanup()
+
+    def test_abort_then_immediate_resume(self):
+        # 第一次只跑完 offset 并发布，随后在 cursor/window 途中中止
+        page_log: dict[str, int] = {}
+
+        async def abort_hook(source: str, pages: int):
+            page_log[source] = pages
+            if source == "offset":
+                return
+            if sum(v for k, v in page_log.items() if k != "offset") >= 2:
+                raise AbortSync("模拟强制中止")
+
+        engine = SyncEngine(
+            make_config(
+                self.base_url, self.state_dir, on_page=abort_hook
+            )
+        )
+        with self.assertRaises(AbortSync):
+            asyncio.run(engine.run())
+        engine.close()
+
+        storage = Storage(self.state_dir)
+        try:
+            published_before = storage.published_sources()
+            # 中止点之前的进度已落盘
+            self.assertIsNotNone(storage.get_progress("offset"))
+            # 尚未完成的来源没有发布半成品
+            for name in ("cursor", "window"):
+                if name not in published_before:
+                    with self.assertRaises(RuntimeError):
+                        storage.read_snapshot(name)
+        finally:
+            storage.close()
+
+        # 立即重跑：从已保存进度续读，最终与一次跑完的结果一致
+        engine = SyncEngine(make_config(self.base_url, self.state_dir))
+        try:
+            results = asyncio.run(engine.run())
+        finally:
+            engine.close()
+        unique_sizes = {
+            k: unique_order_count(v)
+            for k, v in self.server.gateway.datasets.items()
+        }
+        self.assertEqual(set(results), {"offset", "cursor", "window"})
+        for name, info in results.items():
+            self.assertEqual(info["record_count"], unique_sizes[name])
+        storage = Storage(self.state_dir)
+        try:
+            for name in ("offset", "cursor", "window"):
+                rows = storage.read_snapshot(name)
+                self.assertEqual(len(rows), unique_sizes[name])
+                # 每单号仅一条（最高修订）
+                self.assertEqual(
+                    len({r["order_id"] for r in rows}), len(rows)
+                )
+        finally:
+            storage.close()
 
 
 if __name__ == "__main__":

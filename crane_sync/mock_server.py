@@ -32,7 +32,10 @@ def _iso(dt: datetime) -> str:
 
 
 def build_datasets(seed: int = 20261118) -> dict:
-    """生成三套数据集，单号/修订号在供应商之间共用。"""
+    """生成三套数据集，单号/修订号在供应商之间共用。
+
+    ``seed`` 只影响间隙读数的微小扰动，数据形状保持稳定。
+    """
     base = datetime(2026, 11, 10, 8, 0, 0)
     all_orders: dict[str, list[dict]] = {}
     for i in range(1, 41):  # 40 个单号
@@ -77,6 +80,58 @@ def build_datasets(seed: int = 20261118) -> dict:
         "cursor": cursor_rows,
         "window": window_rows,
     }
+
+
+# ----------------------------------------------------------------------
+# 大正文模拟数据（同一秒集中到达）
+# ----------------------------------------------------------------------
+class BulkRows:
+    """惰性生成的大正文数据集（序列协议）。
+
+    所有记录共享同一个 ``inspected_at``（即"同一秒集中到达"），每条正文
+    含一个约 ``record_bytes`` 的大字段。记录按需生成、共享同一份填充
+    字符串，模拟源自身内存占用与数据集总大小无关。
+    """
+
+    def __init__(
+        self,
+        count: int,
+        record_bytes: int,
+        inspected_at: str = "2026-11-10T08:00:00",
+        order_prefix: str = "BULK",
+    ):
+        self.count = int(count)
+        self.record_bytes = max(64, int(record_bytes))
+        self.inspected_at = inspected_at
+        self.order_prefix = order_prefix
+        # 预留 order_id/字段名/间隙的固定开销
+        overhead = 260
+        self._pad = "x" * max(0, self.record_bytes - overhead)
+
+    def __len__(self) -> int:
+        return self.count
+
+    def row(self, idx: int) -> dict:
+        return {
+            "order_id": f"{self.order_prefix}-{idx:05d}",
+            "revision": 1,
+            "inspected_at": self.inspected_at,
+            "gaps": [
+                {"point": "rail", "value": 8000 + idx, "unit": "um"},
+                {"point": "trolley", "value": 12000 - idx, "unit": "um"},
+            ],
+            "notes": self._pad,
+        }
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            start, stop, step = key.indices(self.count)
+            return [self.row(i) for i in range(start, stop, step or 1)]
+        return self.row(key)
+
+    def iter_rows(self):
+        for i in range(self.count):
+            yield self.row(i)
 
 
 # ----------------------------------------------------------------------
@@ -218,6 +273,63 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_json_stream(
+        self,
+        head: dict,
+        rows,
+        start: int,
+        stop: int,
+        tail: dict | None = None,
+        headers: dict | None = None,
+    ):
+        """分块流式写出 ``{**head, "orders": rows[start:stop], **tail}``。
+
+        大正文数据集按 ``stream_chunk`` 条一批编码并写出，服务端不必先把
+        整个响应体拼进内存。响应不带 Content-Length（HTTP/1.0 短连接），
+        客户端读到连接关闭即为正文结束。
+        """
+        self.protocol_version = "HTTP/1.0"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Connection", "close")
+        for k, v in (headers or {}).items():
+            self.send_header(k, str(v))
+        self.end_headers()
+
+        head_bytes = json.dumps(head, ensure_ascii=False).encode("utf-8")
+        # head 是完整对象：去掉末尾 '}'，接上 orders 数组
+        parts = [head_bytes[:-1]]
+        if head:
+            parts.append(b", ")
+        parts.append(b'"orders": [')
+        self.wfile.write(b"".join(parts))
+
+        chunk = max(1, self.state.stream_chunk)
+        byte_cap = max(4096, self.state.stream_chunk_bytes)
+        first = True
+        buf: list[bytes] = []
+        buf_bytes = 0
+        buf_records = 0
+        for i in range(start, stop):
+            encoded = json.dumps(rows[i], ensure_ascii=False).encode("utf-8")
+            buf.append(b", " if not first else b"")
+            buf.append(encoded)
+            buf_bytes += len(encoded) + 2
+            buf_records += 1
+            first = False
+            if buf_records >= chunk or buf_bytes >= byte_cap:
+                self.wfile.write(b"".join(buf))
+                buf, buf_bytes, buf_records = [], 0, 0
+        if buf:
+            self.wfile.write(b"".join(buf))
+
+        self.wfile.write(b"]")
+        if tail:
+            tail_bytes = json.dumps(tail, ensure_ascii=False).encode("utf-8")
+            self.wfile.write(b", " + tail_bytes[1:-1])
+        self.wfile.write(b"}")
+        self.wfile.flush()
+
     def _gateway_authorized(self) -> bool:
         """额度+令牌校验；失败时已写出响应，返回 False。"""
         ok, retry = self.state.gateway.charge()
@@ -292,13 +404,25 @@ class _Handler(BaseHTTPRequestHandler):
         rows = self.state.gateway.datasets["offset"]
         limit = int(qs.get("limit", 10))
         offset = int(qs.get("offset", 0))
-        page = rows[offset : offset + limit]
+        total = len(rows)
+        end = min(total, offset + limit)
+        next_offset = offset + limit if offset + limit < total else None
+        if isinstance(rows, BulkRows) and end > offset:
+            # 大正文：逐条流式写出，不把整页物化/序列化进内存
+            self._send_json_stream(
+                {},
+                rows,
+                offset,
+                end,
+                {"next_offset": next_offset, "total": total},
+            )
+            return
         self._send_json(
             200,
             {
-                "orders": page,
-                "next_offset": offset + limit if offset + limit < len(rows) else None,
-                "total": len(rows),
+                "orders": rows[offset:end],
+                "next_offset": next_offset,
+                "total": total,
             },
         )
 
@@ -388,6 +512,10 @@ class MockServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def shutdown(self) -> None:  # noqa: D401 - 显式关闭监听套接字
+        super().shutdown()
+        self.server_close()
+
     def __init__(
         self,
         addr: tuple[str, int],
@@ -397,9 +525,21 @@ class MockServer(ThreadingHTTPServer):
         window_window: float,
         token_ttl: float,
         cursor_rotate_after: int | None,
+        offset_bulk_count: int | None = None,
+        offset_record_bytes: int = 0,
+        stream_chunk: int = 64,
+        stream_chunk_bytes: int = 256 * 1024,
     ):
         super().__init__(addr, _Handler)
         datasets = build_datasets()
+        if offset_bulk_count:
+            # 偏移源换成"同一秒集中到达"的大正文数据集；
+            # 惰性生成，模拟源自身不保存整份正文。
+            datasets["offset"] = BulkRows(
+                offset_bulk_count, offset_record_bytes
+            )
+        self.stream_chunk = max(1, int(stream_chunk))
+        self.stream_chunk_bytes = max(4096, int(stream_chunk_bytes))
         self.gateway = GatewayState(
             gateway_quota,
             gateway_window,
@@ -429,6 +569,10 @@ def serve_forever(config: dict) -> MockServer:
         config.get("window_window", 5.0),
         config.get("token_ttl", 300.0),
         config.get("cursor_rotate_after"),
+        config.get("offset_bulk_count"),
+        config.get("offset_record_bytes", 0),
+        config.get("stream_chunk", 64),
+        config.get("stream_chunk_bytes", 256 * 1024),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
