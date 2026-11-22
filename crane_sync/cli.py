@@ -90,6 +90,8 @@ def _load_config(path: str, overrides: dict) -> SyncConfig:
     raw.update({k: v for k, v in overrides.items() if v is not None})
     allowed = {f for f in SyncConfig.__dataclass_fields__}  # type: ignore[attr-defined]
     raw = {k: v for k, v in raw.items() if k in allowed}
+    if "sources" in raw:
+        raw["sources"] = tuple(raw["sources"])
     return SyncConfig(**raw)
 
 
@@ -98,8 +100,19 @@ def cmd_sync(args) -> int:
     overrides = {
         "state_dir": args.state_dir,
         "snapshot_format": args.format,
+        "lock_wait": args.lock_wait,
     }
     config = _load_config(args.config, overrides)
+    if args.sources:
+        config.sources = tuple(args.sources)
+    unknown = set(config.sources) - {"offset", "cursor", "window"}
+    if unknown:
+        print(f"未知来源: {', '.join(sorted(unknown))}", file=sys.stderr)
+        return 2
+    if not config.sources:
+        print("没有可同步的来源", file=sys.stderr)
+        return 2
+
     engine = SyncEngine(config)
     try:
         try:
@@ -107,9 +120,16 @@ def cmd_sync(args) -> int:
         except RuntimeError as exc:
             print(f"同步失败: {exc}", file=sys.stderr)
             return 1
+        skipped = dict(engine.skipped)
     finally:
         engine.close()
-    print("\n=== 同步完成，各来源独立发布快照 ===")
+
+    print(
+        f"\n=== 同步完成（本进程来源: {', '.join(config.sources)}）==="
+    )
+    for name in config.sources:
+        if name in skipped:
+            print(f"  {name:7s} 跳过：{skipped[name]}")
     for name, info in results.items():
         print(
             f"  {name:7s} 快照={info['snapshot_id']} "
@@ -168,6 +188,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync.add_argument("--config", required=True)
     p_sync.add_argument("--state-dir", default=None)
     p_sync.add_argument("--format", default=None, choices=["jsonl", "parquet"])
+    p_sync.add_argument(
+        "--sources",
+        nargs="+",
+        choices=["offset", "cursor", "window"],
+        default=None,
+        help="本进程负责的来源（默认三个全做）；多个 sync 进程按来源分工",
+    )
+    p_sync.add_argument(
+        "--lock-wait",
+        type=float,
+        default=None,
+        help="等待同源锁的秒数；默认 0：同源已有进程时直接跳过该来源",
+    )
     p_sync.add_argument("-v", "--verbose", action="store_true")
     p_sync.set_defaults(func=cmd_sync)
 

@@ -11,12 +11,24 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable
 
+from typing import Any, Awaitable, Callable, Protocol, TypeVar
+
 from .http import HttpClient
-from .limits import IndependentLimiter, SharedGateway
+from .limits import IndependentLimiter
 from .models import InspectionOrder
 from .storage import Storage
 
 logger = logging.getLogger("crane_sync")
+
+T = TypeVar("T")
+
+
+class GatewayLike(Protocol):
+    """共享网关接口：进程内 SharedGateway 或跨进程 CrossProcessGateway。"""
+
+    async def request(
+        self, send: Callable[[str | None], Awaitable[T]], owner: object = ...
+    ) -> T: ...
 
 
 class BaseFetcher:
@@ -73,7 +85,7 @@ class OffsetFetcher(BaseFetcher):
 
     name = "offset"
 
-    def __init__(self, storage, client, base_url, gateway: SharedGateway, **kw):
+    def __init__(self, storage, client, base_url, gateway: GatewayLike, **kw):
         super().__init__(storage, client, base_url, **kw)
         self.gateway = gateway
         self._pages = 0
@@ -126,7 +138,7 @@ class CursorFetcher(BaseFetcher):
 
     name = "cursor"
 
-    def __init__(self, storage, client, base_url, gateway: SharedGateway, **kw):
+    def __init__(self, storage, client, base_url, gateway: GatewayLike, **kw):
         super().__init__(storage, client, base_url, **kw)
         self.gateway = gateway
         self._pages = 0

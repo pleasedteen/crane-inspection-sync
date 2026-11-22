@@ -19,9 +19,15 @@
 python3 run_tests.py
 ```
 
-实测约 22 秒完成 14 项测试，覆盖：毫米/微米归一、三源端到端发布、共享额度与
+实测约 37 秒完成 20 项测试，覆盖：毫米/微米归一、三源端到端发布、共享额度与
 令牌只续期一次、游标清单过期重读且旧快照可读、时间窗边界去重、强制中止后续跑、
-并发公平性、Parquet（有 pyarrow 时）以及真实子进程的 serve→sync→read 链路。
+并发公平性、Parquet（有 pyarrow 时）、真实子进程的 serve→sync→read 链路，以及
+**多进程按来源分工**的 6 项（同源不重复拉取发布、跨进程共享额度/令牌只续一次、
+等响应时另一源继续翻页、页间被杀后断点续跑、来源锁随进程退出释放）。
+
+"同源不重复拉取发布、跨源共用额度令牌且只续一次、断点重跑接得上"这 3 个关键点
+集中在 `tests/test_multiprocess.py`，可用 `python3 -m unittest tests.test_multiprocess -v`
+单独查看。
 
 也可用标准 unittest：
 
@@ -59,6 +65,34 @@ python3 -m crane_sync sync --config mock.json
 每个来源读完整轮清单后**独立发布**一次原子快照，结尾打印各来源快照 ID、格式、
 记录数与文件路径。
 
+#### 2.1) 按来源拆到多个 sync 进程（同一状态目录）
+
+用 `--sources` 指定本进程负责的来源，多个进程共用同一个 `--state-dir` 即可按
+来源分工、并行同步：
+
+```bash
+# 终端 1：只做偏移源
+python3 -m crane_sync sync --config mock.json --sources offset
+# 终端 2：只做游标源
+python3 -m crane_sync sync --config mock.json --sources cursor
+# 终端 3：时间窗源
+python3 -m crane_sync sync --config mock.json --sources window
+```
+
+多进程协作规则：
+
+- **同源不重复拉取/发布**：每个来源有一把 `state/<source>.lock`（`flock` 独占）。
+  同源采集进程还在跑时，后启动的同源进程**跳过该来源**——不拉取、不发布，
+  结尾打印“跳过”原因；其他来源照常进行。进程被杀时内核释放锁，不留死锁。
+  需要排队等待而不是跳过时，加 `--lock-wait 30`。
+- **跨源共用额度与令牌**：偏移源与游标源共享同一网关额度池和同一访问令牌，
+  状态存于 `sync_state.db`，对所有进程生效。额度在发 HTTP **之前**就用
+  `BEGIN IMMEDIATE` 原子占位，因此一边等响应时，另一边只要有额度就能继续翻页。
+- **令牌只续一次**：令牌与世代号存库，续期前后比对世代；同一失效令牌并发 401
+  时只触发一次续期，其余进程直接复用新令牌。
+- **断点续跑**：分页进度每页落盘。进程在页间被杀后，重跑用同一状态目录即从
+  已保存的续点（偏移量/游标/时间窗 `to`）接手，不从头再来。
+
 ### 3) 读取已发布快照
 
 ```bash
@@ -91,19 +125,25 @@ python3 -m crane_sync read --state-dir ./state --source offset
   快照按清单行号（`position` 列）保序。**重读期间上一版已发布快照仍可正常读取**。
 - **时间窗源**：进度记录最后一个窗口的 `to`，重跑从此处继续。
 
-### 额度、冷却与令牌（`limits.py`）
+### 额度、冷却与令牌（`limits.py` / `coordination.py`）
 - 偏移源与游标源**共用**同一网关的滑动窗口额度和同一访问令牌；数据请求与令牌
-  续期都消耗额度；续期后旧令牌立即失效。
+  续期都消耗额度；续期后旧令牌立即失效。单进程运行时由 `limits.py` 在内存中
+  实现；**多进程运行时由 `coordination.py` 把额度、冷却、令牌持久化到 SQLite，
+  供同一状态目录下的所有 sync 进程共享**。
 - 滑动窗口按“来源”轮询发放（round-robin），额度允许时每个来源都能持续获得采集
   机会，一个来源等待响应或冷却时其他来源照常推进。
 - 收到 HTTP 429 按 `Retry-After` 进入冷却；冷却门只阻塞对应来源。
-- **同一失效令牌只续期一次**：按令牌世代记录是否已续期，并发的两个来源同时 401
-  时只触发一次续期，另一个直接复用新令牌。
+- **同一失效令牌只续期一次**：按令牌世代记录是否已续期，并发的两个来源（无论
+  同进程还是跨进程）同时 401 时只触发一次续期，另一个直接复用新令牌。
 - 时间窗源使用独立额度，不与网关互相阻塞。
+- 跨进程 `flock` 来源锁保证同源只有一个进程在采集；额度占位在 HTTP 请求前提交，
+  所以进程之间可以真正并行发请求。
 
 ### 快照与可恢复性（`storage.py`）
 - 状态存于 `state/sync_state.db`（SQLite，WAL 模式）：分页进度、暂存记录、已发布
-  指针与快照表。
+  指针与快照表；网关额度/令牌也存于此，供多个 sync 进程共享。
+- **按来源分区**：每个来源有独占锁 `state/locks/<source>.lock`，保证同一时刻
+  只有一个进程采集/发布该来源。
 - **原子发布**：先把完整快照写到不可见临时文件并 `os.replace` 改名，再在一个 DB
   事务里切换“已发布”指针；维保人员只能读到完整发布后的快照。发布成功后旧快照表
   与旧文件才被删除。
@@ -116,15 +156,17 @@ python3 -m crane_sync read --state-dir ./state --source offset
 ```
 crane_sync/
   models.py       数据模型与 mm/μm 归一
-  limits.py       滑动窗口额度、冷却门、共享网关令牌（401/429/410 处理）
+  limits.py       进程内滑动窗口额度、冷却门、共享网关令牌（401/429/410 处理）
+  coordination.py 跨进程来源锁、SQLite 共享额度/冷却/令牌（多进程按来源分工）
   http.py         标准库 JSON HTTP 客户端（线程池非阻塞）
   mock_server.py  三个自带本地模拟 HTTP 数据源 + 网关额度/令牌/游标轮换
   fetchers.py     偏移/游标/时间窗三个采集器（分页、进度、发布）
   storage.py      SQLite 进度/暂存/原子发布，JSONL/Parquet 快照，合并读取
-  engine.py       异步并发编排三个来源
-  cli.py          serve / sync / read 命令行
+  engine.py       异步并发编排来源，按来源抢锁（同源在跑则跳过）
+  cli.py          serve / sync / read 命令行（sync --sources 按来源分工）
 tests/
-  test_sync.py    14 项自动化测试（含真实子进程链路）
+  test_sync.py        14 项单进程/端到端测试（含真实子进程链路）
+  test_multiprocess.py 6 项多进程测试（同源跳过、共享额度令牌、断点续跑）
 run_tests.py      一键测试入口
 config.example.json
 requirements.txt

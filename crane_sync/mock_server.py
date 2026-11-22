@@ -292,6 +292,9 @@ class _Handler(BaseHTTPRequestHandler):
         rows = self.state.gateway.datasets["offset"]
         limit = int(qs.get("limit", 10))
         offset = int(qs.get("offset", 0))
+        self.state.log_request("offset", offset=offset, limit=limit)
+        if self.state.delay:
+            time.sleep(self.state.delay)
         page = rows[offset : offset + limit]
         self._send_json(
             200,
@@ -308,6 +311,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.state.gateway.note_cursor_call()
         rows = self.state.gateway.cursor_manifest()
         version = self.state.gateway.cursor_version
+        self.state.log_request("cursor_manifest", version=f"v{version}")
         # 清单只给 ID/修订顺序，正文仍走 /cursor/orders
         entries = [
             {"order_id": r["order_id"], "revision": r["revision"]} for r in rows
@@ -330,6 +334,7 @@ class _Handler(BaseHTTPRequestHandler):
         limit = int(qs.get("limit", 10))
         if cursor is None:
             return self._send_json(400, {"error": "cursor required"})
+        self.state.log_request("cursor", cursor=cursor, limit=limit)
         try:
             cur_ver, start, _token = cursor.split(":")
             if int(cur_ver.lstrip("v")) != version:
@@ -374,6 +379,7 @@ class _Handler(BaseHTTPRequestHandler):
         # 闭区间 [from, to]：相邻窗口在边界上重叠，边界记录会重复返回
         selected = [r for r in rows if frm <= r["inspected_at"] <= to]
         selected.sort(key=lambda r: (r["inspected_at"], r["order_id"], r["revision"]))
+        self.state.log_request("window", frm=frm, to=to)
         self._send_json(
             200,
             {
@@ -397,9 +403,11 @@ class MockServer(ThreadingHTTPServer):
         window_window: float,
         token_ttl: float,
         cursor_rotate_after: int | None,
+        delay_ms: int = 0,
     ):
         super().__init__(addr, _Handler)
         datasets = build_datasets()
+        self.delay = max(0, delay_ms) / 1000.0
         self.gateway = GatewayState(
             gateway_quota,
             gateway_window,
@@ -409,6 +417,17 @@ class MockServer(ThreadingHTTPServer):
         )
         self.window_quota = SlidingWindow(window_quota, window_window)
         self.window_rejected = 0
+        # 数据请求日志，供测试核对分页续读（只记来源与关键分页参数）
+        self.request_log: list[dict] = []
+        self._request_log_lock = threading.Lock()
+
+    def log_request(self, source: str, **fields) -> None:
+        with self._request_log_lock:
+            self.request_log.append({"source": source, **fields})
+
+    def requests_for(self, source: str) -> list[dict]:
+        with self._request_log_lock:
+            return [r for r in self.request_log if r["source"] == source]
 
     def admin_stats(self) -> dict:
         ds = self.gateway.datasets
@@ -429,6 +448,7 @@ def serve_forever(config: dict) -> MockServer:
         config.get("window_window", 5.0),
         config.get("token_ttl", 300.0),
         config.get("cursor_rotate_after"),
+        config.get("delay_ms", 0),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

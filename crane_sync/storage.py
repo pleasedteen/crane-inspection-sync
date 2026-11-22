@@ -34,10 +34,12 @@ class Storage:
         self.db_path = self.state_dir / "sync_state.db"
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(
-            str(self.db_path), check_same_thread=False, isolation_level=None
+            str(self.db_path), timeout=30.0, check_same_thread=False,
+            isolation_level=None,
         )
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA busy_timeout=30000")
         self._init_schema()
 
     # ---------- schema ----------
@@ -299,7 +301,7 @@ class Storage:
         file_path = self._write_snapshot_file(source, snapshot_id, rows, fmt)
         with self._lock:
             old = self.latest_snapshot_info(source)
-            self._conn.execute("BEGIN")
+            self._conn.execute("BEGIN IMMEDIATE")
             try:
                 # 与 _latest_revision_rows 等价的 SQL：仅保留每单号最高修订
                 self._conn.execute(
