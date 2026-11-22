@@ -3,7 +3,8 @@
 每个采集器：
 - 每成功读完一页就把分页进度落盘（强制中止后可续读）；
 - 记录写入暂存表（按 来源+单号+修订号 去重，间隙已归一为毫米）；
-- 读完整轮清单后独立发布原子快照，发布后才对读者可见。
+- 读完整轮清单后独立发布原子快照，发布后才对读者可见；
+- 每次单源发布后通过 on_publish 通知引擎刷新可定位的合并快照。
 """
 from __future__ import annotations
 
@@ -30,6 +31,7 @@ class BaseFetcher:
         page_size: int = 10,
         snapshot_format: str = "jsonl",
         on_page: Callable[[str, int], Awaitable[None]] | None = None,
+        on_publish: Callable[[str, dict], None] | None = None,
     ):
         self.storage = storage
         self.client = client
@@ -38,6 +40,8 @@ class BaseFetcher:
         self.snapshot_format = snapshot_format
         # 测试钩子：每处理完一页调用一次，便于做"中途中止"测试
         self.on_page = on_page
+        # 单源发布完成后的回调（引擎借此触发合并快照刷新）
+        self.on_publish = on_publish
         self._position = 0
 
     async def _page_hook(self) -> None:
@@ -63,6 +67,17 @@ class BaseFetcher:
     def _track_sequence(self) -> bool:
         """是否按来源清单行序维护 position（游标源必须为 True）。"""
         return False
+
+    def _finalize(self) -> dict:
+        """读完整轮清单后发布本来源快照，并通知引擎刷新合并快照。"""
+        info = self.storage.publish_snapshot(self.name, self.snapshot_format)
+        logger.info(
+            "[%s] 已发布快照 %s（%s 条）",
+            self.name, info["snapshot_id"], info["record_count"],
+        )
+        if self.on_publish is not None:
+            self.on_publish(self.name, info)
+        return info
 
     async def run(self) -> dict:  # pragma: no cover - 抽象方法
         raise NotImplementedError
@@ -111,10 +126,7 @@ class OffsetFetcher(BaseFetcher):
             await self._page_hook()
             if offset is None:
                 break
-        info = self.storage.publish_snapshot(self.name, self.snapshot_format)
-        logger.info("[offset] 已发布快照 %s（%s 条）", info["snapshot_id"],
-                    info["record_count"])
-        return info
+        return self._finalize()
 
 
 class CursorFetcher(BaseFetcher):
@@ -199,10 +211,7 @@ class CursorFetcher(BaseFetcher):
             if cursor is None:
                 break
 
-        info = self.storage.publish_snapshot(self.name, self.snapshot_format)
-        logger.info("[cursor] 已发布快照 %s（%s 条）", info["snapshot_id"],
-                    info["record_count"])
-        return info
+        return self._finalize()
 
     async def run(self) -> dict:
         """带 410 过期处理的入口：清单过期则清空进度从头重读。"""
@@ -277,7 +286,4 @@ class WindowFetcher(BaseFetcher):
             await self._page_hook()
             # 下一窗口与当前窗口首尾相接（闭区间天然重叠一条边界记录）
             start = end
-        info = self.storage.publish_snapshot(self.name, self.snapshot_format)
-        logger.info("[window] 已发布快照 %s（%s 条）", info["snapshot_id"],
-                    info["record_count"])
-        return info
+        return self._finalize()

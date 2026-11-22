@@ -5,6 +5,9 @@
 - 各来源暂存记录（按 来源+单号+修订号 去重）
 - 快照原子发布：先把完整快照写成不可见临时文件并 rename，
   再在一个数据库事务里切换"已发布"指针；读者只会看到完整快照。
+- 合并快照：每次单源发布后，把各来源最新已发布快照的合并结果
+  （与 read_merged 相同的投影）也原子发布为一份可定位的快照文件；
+  合并写出中途失败/被强停时，读者仍只看到上一份完整合并结果。
 - 合并读取：每个来源只取其最新已发布快照，单号只保留最高修订。
 
 快照文件格式支持 JSON Lines（零依赖）与 Parquet（需 pyarrow）。
@@ -20,6 +23,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .models import InspectionOrder
+
+# 合并快照在 publications 表中的伪来源名（不会与真实数据来源重名）
+MERGED_SOURCE = "merged"
 
 
 def _utcnow() -> str:
@@ -217,11 +223,14 @@ class Storage:
 
     # ---------- snapshot publish ----------
     def published_sources(self) -> list[str]:
+        """已发布快照的数据来源（不含合并快照伪来源 merged）。"""
         with self._lock:
             return [
                 r[0]
                 for r in self._conn.execute(
-                    "SELECT source FROM publications ORDER BY source"
+                    "SELECT source FROM publications WHERE source != ? "
+                    "ORDER BY source",
+                    (MERGED_SOURCE,),
                 ).fetchall()
             ]
 
@@ -248,6 +257,12 @@ class Storage:
     ) -> str:
         out_dir = self.state_dir / "snapshots" / source
         out_dir.mkdir(parents=True, exist_ok=True)
+        # 清理上次写出中途失败/被强停留下的不可见临时文件（读者从不读它们）
+        for stale in out_dir.glob("*.tmp"):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
         if fmt == "jsonl":
             final = out_dir / f"{snapshot_id}.jsonl"
             tmp = final.with_suffix(".jsonl.tmp")
@@ -384,8 +399,11 @@ class Storage:
                 for r in cur.fetchall()
             ]
 
-    def read_merged(self, sources: list[str] | None = None) -> list[dict]:
-        """跨来源合并：只取各来源最新已发布快照，单号仅保留最高修订。"""
+    def _merged_rows(self, sources: list[str] | None = None) -> list[dict]:
+        """合并投影：各数据来源最新已发布快照按单号取最高修订。
+
+        与 read --merged 的结果完全一致；发布合并快照与实时合并都走这里。
+        """
         published = self.published_sources()
         if sources:
             published = [s for s in published if s in sources]
@@ -422,3 +440,97 @@ class Storage:
                 }
                 for r in cur.fetchall()
             ]
+
+    def publish_merged(self, fmt: str = "jsonl") -> dict:
+        """把当前各数据来源的已发布快照合并发布为一份可定位的合并快照。
+
+        - 合并投影与 read --merged 相同（跨来源每单号仅最高修订）；
+        - 在写出前一刻才读取各来源最新已发布指针，因此写出动作若曾被
+          卡住，恢复后等待期间完成的单源发布也会被纳入本次合并；
+        - 与单源发布同样原子：先写不可见临时文件并 rename，再在一个
+          事务里切换 merged 指针；写出中途失败/强停时，读者仍只看到
+          上一份完整合并结果。
+        """
+        rows = self._merged_rows()
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+        snapshot_id = f"{stamp}_{random.getrandbits(24):06x}"
+        table_name = f"snap_{MERGED_SOURCE}_{snapshot_id}"
+        file_path = self._write_snapshot_file(
+            MERGED_SOURCE, snapshot_id, rows, fmt
+        )
+        with self._lock:
+            old = self.latest_snapshot_info(MERGED_SOURCE)
+            self._conn.execute("BEGIN")
+            try:
+                self._conn.execute(
+                    f"CREATE TABLE {table_name}("
+                    "order_id TEXT NOT NULL, revision INTEGER NOT NULL, "
+                    "source TEXT NOT NULL, inspected_at TEXT NOT NULL, "
+                    "gaps_json TEXT NOT NULL, position INTEGER NOT NULL)"
+                )
+                self._conn.executemany(
+                    f"INSERT INTO {table_name}(order_id,revision,source,"
+                    "inspected_at,gaps_json,position) VALUES(?,?,?,?,?,?)",
+                    [
+                        (
+                            r["order_id"],
+                            r["revision"],
+                            r["source"],
+                            r["inspected_at"],
+                            json.dumps(r["gaps"], ensure_ascii=False),
+                            idx,
+                        )
+                        for idx, r in enumerate(rows)
+                    ],
+                )
+                self._conn.execute(
+                    "INSERT INTO publications(source,snapshot_id,snapshot_table,"
+                    "file_path,format,record_count,published_at) "
+                    "VALUES(?,?,?,?,?,?,?) "
+                    "ON CONFLICT(source) DO UPDATE SET "
+                    "snapshot_id=excluded.snapshot_id,"
+                    "snapshot_table=excluded.snapshot_table,"
+                    "file_path=excluded.file_path,format=excluded.format,"
+                    "record_count=excluded.record_count,"
+                    "published_at=excluded.published_at",
+                    (
+                        MERGED_SOURCE,
+                        snapshot_id,
+                        table_name,
+                        file_path,
+                        fmt,
+                        len(rows),
+                        _utcnow(),
+                    ),
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+            # 旧合并快照在新指针提交后再删除；读者永远不会看到半成品
+            if old and old["snapshot_id"] != snapshot_id:
+                self._conn.execute(
+                    "DROP TABLE IF EXISTS " + old["snapshot_table"]
+                )
+                old_file = old.get("file_path")
+                if old_file:
+                    try:
+                        os.remove(old_file)
+                    except OSError:
+                        pass
+        info = self.latest_snapshot_info(MERGED_SOURCE)
+        assert info is not None
+        return info
+
+    def read_merged(self, sources: list[str] | None = None) -> list[dict]:
+        """读取最新已发布的合并快照（每单号仅最高修订）。
+
+        合并快照由每次单源发布后原子切换；指针切换前读者始终只看到
+        上一份完整合并结果。旧状态目录还没有合并发布、或调用方显式
+        指定来源子集时，退化为按当前各来源已发布快照实时合并。
+        """
+        if sources is None:
+            info = self.latest_snapshot_info(MERGED_SOURCE)
+            if info is not None:
+                return self.read_snapshot(MERGED_SOURCE)
+        return self._merged_rows(sources)

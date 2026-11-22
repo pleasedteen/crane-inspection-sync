@@ -21,7 +21,7 @@ from pathlib import Path
 from crane_sync.engine import AbortSync, SyncConfig, SyncEngine
 from crane_sync.models import InspectionOrder, normalize_gap
 from crane_sync.mock_server import MockServer, build_datasets
-from crane_sync.storage import Storage
+from crane_sync.storage import MERGED_SOURCE, Storage
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -69,6 +69,12 @@ def admin_stats(base_url: str) -> dict:
 def unique_order_count(rows: list[dict]) -> int:
     """已发布快照每个单号只保留最高修订，故条数=唯一单号数。"""
     return len({r["order_id"] for r in rows})
+
+
+def expected_merged_count(server: MockServer) -> int:
+    """三套数据集合并后（每单号仅最高修订）的期望条数。"""
+    all_rows = [r for rows in server.gateway.datasets.values() for r in rows]
+    return unique_order_count(all_rows)
 
 
 class UnitNormalizationTests(unittest.TestCase):
@@ -177,6 +183,36 @@ class EndToEndTests(unittest.TestCase):
             places=6,
         )
 
+        # 每次单源发布都会交付可定位的合并快照文件：
+        # 路径已登记、文件存在、内容与 read_merged 一致、格式随配置
+        self.assertIsNotNone(engine.merged_info)
+        minfo = engine.merged_info
+        self.assertEqual(minfo["format"], "jsonl")
+        self.assertEqual(minfo["record_count"], expected_merged_count(self.server))
+        mpath = Path(minfo["file_path"])
+        self.assertTrue(mpath.exists())
+        self.assertEqual(mpath.suffix, ".jsonl")
+        storage = Storage(self.state_dir)
+        try:
+            self.assertEqual(
+                storage.latest_snapshot_info(MERGED_SOURCE)["snapshot_id"],
+                minfo["snapshot_id"],
+            )
+            merged_rows = storage.read_merged()
+        finally:
+            storage.close()
+        file_rows = [
+            json.loads(line)
+            for line in mpath.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(
+            [(r["order_id"], r["revision"]) for r in file_rows],
+            [(r["order_id"], r["revision"]) for r in merged_rows],
+        )
+        # 合并结果每个单号只保留最高修订
+        self.assertEqual(len(merged_rows), len({r["order_id"] for r in merged_rows}))
+
     def test_parquet_format_when_available(self):
         try:
             import pyarrow  # noqa: F401
@@ -202,6 +238,18 @@ class EndToEndTests(unittest.TestCase):
             # 间隙列里单位统一为毫米
             for cell in table.column("gaps_json").to_pylist():
                 self.assertIn('"unit": "mm"', cell)
+        # 合并快照同样按配置格式交付为可定位文件
+        minfo = engine.merged_info
+        self.assertIsNotNone(minfo)
+        self.assertEqual(minfo["format"], "parquet")
+        mpath = Path(minfo["file_path"])
+        self.assertTrue(mpath.exists())
+        self.assertEqual(mpath.suffix, ".parquet")
+        import pyarrow.parquet as pq
+
+        mtable = pq.read_table(str(mpath))
+        self.assertEqual(mtable.num_rows, minfo["record_count"])
+        self.assertEqual(minfo["record_count"], expected_merged_count(self.server))
 
     def test_parquet_without_pyarrow_reports_clear_error(self):
         # 模拟 pyarrow 缺失：发布时应给出可操作的错误信息
@@ -280,6 +328,145 @@ class EndToEndTests(unittest.TestCase):
         }
         for name, info in results.items():
             self.assertEqual(info["record_count"], unique_sizes[name])
+
+    def test_stalled_merged_write_includes_later_publications(self):
+        # 第一次合并写出卡住时，其余来源仍要拉完并先发布；
+        # 写出恢复后，等待期间完成的发布必须被纳入本次合并
+        holder: dict[str, SyncEngine] = {}
+
+        async def stall_first_merged_write(attempt: int):
+            if attempt != 0:
+                return
+            engine = holder["engine"]
+            deadline = time.monotonic() + 20
+            # 合并写出"卡住"期间，等另外两个来源完成并先发布
+            while len(engine.storage.published_sources()) < 3:
+                if time.monotonic() > deadline:
+                    raise AssertionError("合并写出卡住期间其他来源未能完成发布")
+                await asyncio.sleep(0.01)
+
+        cfg = make_config(
+            self.base_url, self.state_dir, on_merged_write=stall_first_merged_write
+        )
+        engine = SyncEngine(cfg)
+        holder["engine"] = engine
+        try:
+            results = asyncio.run(engine.run())
+        finally:
+            engine.close()
+
+        self.assertEqual(set(results), {"offset", "cursor", "window"})
+        expected = expected_merged_count(self.server)
+        # 被卡住后恢复的第一次合并发布，就已纳入等待期间完成的发布
+        self.assertGreaterEqual(len(engine.merged_history), 1)
+        self.assertEqual(engine.merged_history[0]["record_count"], expected)
+        # 最终合并快照可定位且内容完整
+        self.assertEqual(engine.merged_info["record_count"], expected)
+        storage = Storage(self.state_dir)
+        try:
+            self.assertEqual(
+                len(storage.read_merged()), expected
+            )
+        finally:
+            storage.close()
+
+    def test_abort_during_merged_write_keeps_previous_merged(self):
+        # 第一轮：正常发布，拿到一份完整合并快照
+        engine = SyncEngine(make_config(self.base_url, self.state_dir))
+        try:
+            asyncio.run(engine.run())
+        finally:
+            engine.close()
+        storage = Storage(self.state_dir)
+        v1_info = storage.latest_snapshot_info(MERGED_SOURCE)
+        self.assertIsNotNone(v1_info)
+        v1_rows = storage.read_merged()
+        storage.close()
+
+        # 第二轮：合并快照写出阶段被强停
+        async def abort_on_merged_write(attempt: int):
+            raise AbortSync("模拟合并写出阶段强停")
+
+        cfg = make_config(
+            self.base_url, self.state_dir, on_merged_write=abort_on_merged_write
+        )
+        engine2 = SyncEngine(cfg)
+        with self.assertRaises(AbortSync):
+            asyncio.run(engine2.run())
+        engine2.close()
+
+        storage = Storage(self.state_dir)
+        # 切换前读者仍只看到上一份完整合并结果
+        self.assertEqual(
+            storage.latest_snapshot_info(MERGED_SOURCE)["snapshot_id"],
+            v1_info["snapshot_id"],
+        )
+        self.assertEqual(storage.read_merged(), v1_rows)
+        self.assertTrue(Path(v1_info["file_path"]).exists())
+        # 未发布来源已落盘的分页进度保留，供重跑续读
+        progresses = {
+            s: storage.get_progress(s) for s in ("offset", "cursor", "window")
+        }
+        storage.close()
+        self.assertTrue(any(p is not None for p in progresses.values()))
+
+        # 第三轮：无钩子重跑，沿用已落盘进度，最终交付新的完整合并快照
+        engine3 = SyncEngine(make_config(self.base_url, self.state_dir))
+        try:
+            results3 = asyncio.run(engine3.run())
+        finally:
+            engine3.close()
+        self.assertEqual(set(results3), {"offset", "cursor", "window"})
+        self.assertIsNotNone(engine3.merged_info)
+        storage = Storage(self.state_dir)
+        try:
+            v3_info = storage.latest_snapshot_info(MERGED_SOURCE)
+            self.assertNotEqual(v3_info["snapshot_id"], v1_info["snapshot_id"])
+            # 数据未变，新合并快照内容与上一份一致且完整
+            self.assertEqual(storage.read_merged(), v1_rows)
+        finally:
+            storage.close()
+
+    def test_merged_write_switch_failure_keeps_previous_published(self):
+        # 合并文件写出/切换中途失败：已发布指针不动，读者仍看到上一份
+        engine = SyncEngine(make_config(self.base_url, self.state_dir))
+        try:
+            asyncio.run(engine.run())
+        finally:
+            engine.close()
+        storage = Storage(self.state_dir)
+        v1 = storage.latest_snapshot_info(MERGED_SOURCE)
+        rows_v1 = storage.read_merged()
+
+        from unittest import mock
+
+        with mock.patch(
+            "crane_sync.storage.os.replace",
+            side_effect=OSError("模拟合并文件切换失败"),
+        ):
+            with self.assertRaises(OSError):
+                storage.publish_merged("jsonl")
+        # 指针未切换，旧合并快照完整可读
+        self.assertEqual(
+            storage.latest_snapshot_info(MERGED_SOURCE)["snapshot_id"],
+            v1["snapshot_id"],
+        )
+        self.assertEqual(storage.read_merged(), rows_v1)
+        self.assertTrue(Path(v1["file_path"]).exists())
+        # 失败现场只留在不可见临时文件里，不作为已发布结果可见
+        leftovers = list(
+            (Path(self.state_dir) / "snapshots" / MERGED_SOURCE).glob("*.tmp")
+        )
+        self.assertTrue(leftovers)
+
+        # 恢复后可正常发布新合并快照，残留临时文件被清理
+        info = storage.publish_merged("jsonl")
+        self.assertNotEqual(info["snapshot_id"], v1["snapshot_id"])
+        self.assertEqual(storage.read_merged(), rows_v1)
+        self.assertFalse(
+            list((Path(self.state_dir) / "snapshots" / MERGED_SOURCE).glob("*.tmp"))
+        )
+        storage.close()
 
     def test_stale_cursor_rereads_new_manifest(self):
         # 清单在第 2 次游标调用后轮换，已保存游标随即过期
@@ -518,6 +705,9 @@ class SubprocessCliTests(unittest.TestCase):
                 )
                 self.assertEqual(sync.returncode, 0, sync.stderr)
                 self.assertIn("同步完成", sync.stdout)
+                # 单源发布的同时交付了可定位的合并快照
+                self.assertIn("合并快照", sync.stdout)
+                self.assertIn("merged", sync.stdout)
 
                 read = subprocess.run(
                     [sys.executable, "-m", "crane_sync", "read",
@@ -527,6 +717,7 @@ class SubprocessCliTests(unittest.TestCase):
                 )
                 self.assertEqual(read.returncode, 0, read.stderr)
                 self.assertIn("合并快照", read.stdout)
+                self.assertIn("快照=", read.stdout)
                 self.assertIn("QC-0001", read.stdout)
                 self.assertIn("mm", read.stdout)
             finally:

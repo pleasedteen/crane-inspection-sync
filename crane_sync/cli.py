@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 from .engine import SyncConfig, SyncEngine
-from .storage import Storage
+from .storage import MERGED_SOURCE, Storage
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -116,14 +116,24 @@ def cmd_sync(args) -> int:
             f"格式={info['format']} 记录数={info['record_count']} "
             f"文件={info['file_path']}"
         )
+    if engine.merged_info is not None:
+        mi = engine.merged_info
+        print("=== 合并快照已随单源发布同步交付 ===")
+        print(
+            f"  {MERGED_SOURCE:7s} 快照={mi['snapshot_id']} "
+            f"格式={mi['format']} 记录数={mi['record_count']} "
+            f"文件={mi['file_path']}"
+        )
     return 0
 
 
 def cmd_read(args) -> int:
     storage = Storage(args.state_dir)
+    merged_info = None
     try:
         if args.merged or not args.source:
             rows = storage.read_merged()
+            merged_info = storage.latest_snapshot_info(MERGED_SOURCE)
             title = "合并快照（每单号仅最高修订，间隙统一毫米）"
         else:
             rows = storage.read_snapshot(args.source)
@@ -134,6 +144,11 @@ def cmd_read(args) -> int:
     finally:
         storage.close()
     print(f"=== {title}，共 {len(rows)} 张巡检单 ===")
+    if merged_info is not None:
+        print(
+            f"  快照={merged_info['snapshot_id']} "
+            f"格式={merged_info['format']} 文件={merged_info['file_path']}"
+        )
     for row in rows:
         gaps = "; ".join(
             f"{g['point']}={g['value_mm']}mm" for g in row["gaps"]
