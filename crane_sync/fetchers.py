@@ -4,17 +4,24 @@
 - 每成功读完一页就把分页进度落盘（强制中止后可续读）；
 - 记录写入暂存表（按 来源+单号+修订号 去重，间隙已归一为毫米）；
 - 读完整轮清单后独立发布原子快照，发布后才对读者可见。
+
+每个采集器绑定一个 SyncSession：会话被取消（中止或被新一轮取代）后，
+采集器在循环边界立即停止，既不再派发 HTTP 请求，也不再写进度/暂存/
+快照——已在途的请求结果会被直接丢弃。
 """
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta
-from typing import Any, Awaitable, Callable
+from typing import Awaitable, Callable, TYPE_CHECKING
 
 from .http import HttpClient
 from .limits import IndependentLimiter, SharedGateway
 from .models import InspectionOrder
 from .storage import Storage
+
+if TYPE_CHECKING:
+    from .engine import SyncSession
 
 logger = logging.getLogger("crane_sync")
 
@@ -30,6 +37,7 @@ class BaseFetcher:
         page_size: int = 10,
         snapshot_format: str = "jsonl",
         on_page: Callable[[str, int], Awaitable[None]] | None = None,
+        session: "SyncSession | None" = None,
     ):
         self.storage = storage
         self.client = client
@@ -38,11 +46,18 @@ class BaseFetcher:
         self.snapshot_format = snapshot_format
         # 测试钩子：每处理完一页调用一次，便于做"中途中止"测试
         self.on_page = on_page
+        # 所属同步会话；取消后该采集器不得再派发请求或落盘
+        self.session = session
         self._position = 0
 
     async def _page_hook(self) -> None:
         if self.on_page is not None:
             await self.on_page(self.name, self.pages_done)
+
+    def _ensure_active(self) -> None:
+        """循环边界检查：会话已取消则抛出 CancelledError 停止本采集器。"""
+        if self.session is not None:
+            self.session.ensure_active()
 
     @property
     def pages_done(self) -> int:
@@ -90,6 +105,9 @@ class OffsetFetcher(BaseFetcher):
         self._pages = 0
         logger.info("[offset] 从 offset=%s 开始（或续读）", offset)
         while True:
+            # 会话已取消：不再派发下一页
+            self._ensure_active()
+
             async def _send(token):
                 return await self.client.get(
                     f"{self.base_url}/offset/orders",
@@ -98,6 +116,8 @@ class OffsetFetcher(BaseFetcher):
                 )
 
             data = await self.gateway.request(_send, owner=self.name)
+            # 在途响应回来时会话可能已被取消：丢弃结果，绝不落盘
+            self._ensure_active()
             written = self._ingest(data.get("orders", []))
             offset = data["next_offset"]
             self._pages += 1
@@ -111,6 +131,7 @@ class OffsetFetcher(BaseFetcher):
             await self._page_hook()
             if offset is None:
                 break
+        self._ensure_active()
         info = self.storage.publish_snapshot(self.name, self.snapshot_format)
         logger.info("[offset] 已发布快照 %s（%s 条）", info["snapshot_id"],
                     info["record_count"])
@@ -152,6 +173,8 @@ class CursorFetcher(BaseFetcher):
             logger.info("[cursor] 无有效游标，从清单开头读取")
 
         while True:
+            self._ensure_active()
+
             async def _send(token):
                 if cursor is None:
                     return await self._load_manifest(token)
@@ -162,6 +185,7 @@ class CursorFetcher(BaseFetcher):
                 )
 
             data = await self.gateway.request(_send, owner=self.name)
+            self._ensure_active()
 
             # 清单入口响应
             if "entries" in data:
@@ -199,6 +223,7 @@ class CursorFetcher(BaseFetcher):
             if cursor is None:
                 break
 
+        self._ensure_active()
         info = self.storage.publish_snapshot(self.name, self.snapshot_format)
         logger.info("[cursor] 已发布快照 %s（%s 条）", info["snapshot_id"],
                     info["record_count"])
@@ -256,6 +281,7 @@ class WindowFetcher(BaseFetcher):
         self._pages = 0
         logger.info("[window] 从时间窗起点 %s 开始（或续读）", start)
         while start <= self.horizon:
+            self._ensure_active()
             end = self._add_minutes(start, self.window_minutes)
             frm, to = start, end
 
@@ -265,6 +291,7 @@ class WindowFetcher(BaseFetcher):
                 )
 
             data = await self.limiter.request(_send, owner=self.name)
+            self._ensure_active()
             written = self._ingest(data.get("orders", []))
             self._pages += 1
             self.storage.set_progress(
@@ -277,6 +304,7 @@ class WindowFetcher(BaseFetcher):
             await self._page_hook()
             # 下一窗口与当前窗口首尾相接（闭区间天然重叠一条边界记录）
             start = end
+        self._ensure_active()
         info = self.storage.publish_snapshot(self.name, self.snapshot_format)
         logger.info("[window] 已发布快照 %s（%s 条）", info["snapshot_id"],
                     info["record_count"])

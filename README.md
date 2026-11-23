@@ -19,9 +19,11 @@
 python3 run_tests.py
 ```
 
-实测约 22 秒完成 14 项测试，覆盖：毫米/微米归一、三源端到端发布、共享额度与
+实测约 28 秒完成 22 项测试，覆盖：毫米/微米归一、三源端到端发布、共享额度与
 令牌只续期一次、游标清单过期重读且旧快照可读、时间窗边界去重、强制中止后续跑、
-并发公平性、Parquet（有 pyarrow 时）以及真实子进程的 serve→sync→read 链路。
+同一引擎多轮运行与取消后立即重跑（续点/额度/冷却沿用）、在途分页与在途令牌
+续期挂起时的取消重跑、并发公平性、Parquet（有 pyarrow 时）以及真实子进程的
+serve→sync→read 链路。
 
 也可用标准 unittest：
 
@@ -99,7 +101,14 @@ python3 -m crane_sync read --state-dir ./state --source offset
 - 收到 HTTP 429 按 `Retry-After` 进入冷却；冷却门只阻塞对应来源。
 - **同一失效令牌只续期一次**：按令牌世代记录是否已续期，并发的两个来源同时 401
   时只触发一次续期，另一个直接复用新令牌。
+- **在途令牌跨取消复用**：首次签发与每次续期都是独立在途任务，等待者被取消
+  （同步轮中止）不会连带取消它；任务完成后经回调把新令牌纳入网关，下一轮同步
+  直接复用，不会因上一轮中止而对同一失效世代重复续期；续期失败则不留标记，
+  允许后续请求重新发起。
 - 时间窗源使用独立额度，不与网关互相阻塞。
+- 额度窗口、冷却门与令牌世代都挂在引擎上而非每轮重建：**同一引擎可在同一事件
+  循环里连续 `run()` 多轮，取消后立即重跑也沿用未耗尽的额度、冷却剩余时间与
+  已取得的令牌**。
 
 ### 快照与可恢复性（`storage.py`）
 - 状态存于 `state/sync_state.db`（SQLite，WAL 模式）：分页进度、暂存记录、已发布
@@ -110,6 +119,12 @@ python3 -m crane_sync read --state-dir ./state --source offset
 - 快照支持 **JSON Lines（默认，零依赖）** 与 **Parquet（需 pyarrow）**。
 - **强制中止可重跑**：每读完一页进度即落盘，重跑时仍有效的分页从已保存进度续读；
   游标若已过期则按上面的 410 规则重读，已发布快照全程可读。
+- **取消后旧轮不再派发和落盘**：每轮 `run()` 对应一个带世代号的 `SyncSession`，
+  中止/取消只 drain 当前会话的采集任务；旧轮协程在循环边界感知到取消后立即停止，
+  既不发新请求也不写进度/暂存/快照，已在途的 HTTP 调用结果直接丢弃。被挂起的旧
+  分页不占用额度，因此不会阻塞其他可请求来源，也不会阻塞紧接着的下一轮。
+- **多轮会话**：HTTP 执行器与网关在引擎生命周期内只创建一次，`run()` 可连续
+  调用；命令行 `sync` 仍是“一轮同步”的单轮用法（每次调用新建引擎、结束即关闭）。
 
 ## 五、目录结构
 
@@ -121,10 +136,10 @@ crane_sync/
   mock_server.py  三个自带本地模拟 HTTP 数据源 + 网关额度/令牌/游标轮换
   fetchers.py     偏移/游标/时间窗三个采集器（分页、进度、发布）
   storage.py      SQLite 进度/暂存/原子发布，JSONL/Parquet 快照，合并读取
-  engine.py       异步并发编排三个来源
-  cli.py          serve / sync / read 命令行
+  engine.py       异步并发编排三个来源；多轮会话、取消 drain 与跨轮限额复用
+  cli.py          serve / sync / read 命令行（sync 保持单轮用法）
 tests/
-  test_sync.py    14 项自动化测试（含真实子进程链路）
+  test_sync.py    22 项自动化测试（含真实子进程链路与挂起取消重跑）
 run_tests.py      一键测试入口
 config.example.json
 requirements.txt
@@ -134,5 +149,10 @@ requirements.txt
 
 - `POST /mock/admin/expire-token`：强制当前令牌立即失效，用于验证 401 续期。
 - `POST /mock/admin/rotate-cursor`：把游标清单轮换到新版，用于验证 410 重读。
-- `GET  /mock/admin/stats`：查看网关请求数、续期次数、429 次数等。
+- `GET  /mock/admin/stats`：查看网关请求数、续期次数、429 次数、挂起状态等。
 - 启动参数 `--cursor-rotate-after N`：第 N 次游标调用后自动轮换清单。
+- `POST /mock/admin/hang`（JSON `{"path": "/offset/orders", "count": 1}`，
+  也支持 GET query）：让接下来 N 个匹配路由的响应在服务端挂起（挂起发生在
+  额度/令牌校验之前，不占额度）。
+- `POST /mock/admin/release`：放行当前所有挂起请求。用于复现“分页或令牌续期
+  响应挂起在途时，取消同步并立即重跑”的场景。

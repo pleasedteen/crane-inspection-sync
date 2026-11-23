@@ -9,6 +9,9 @@
 - 任一来源收到 429 后按其要求的 retry_after 进入冷却，冷却期间
   其他来源照常推进。
 - 同一失效令牌只续期一次（按令牌世代记录是否已续期）。
+- 首次签发与每次续期都以"在途任务"形式运行：等待者被取消（如同步轮
+  被整体中止）不会连带取消令牌任务；任务完成后自动把新令牌纳入网关，
+  下一轮同步可直接复用，不会因上一轮中止而重复续期同一失效世代。
 """
 from __future__ import annotations
 
@@ -142,7 +145,13 @@ class GatewayError(Exception):
 
 
 class SharedGateway:
-    """偏移源/游标源共用的网关：共享额度 + 共享令牌。"""
+    """偏移源/游标源共用的网关：共享额度 + 共享令牌。
+
+    令牌的首次签发与每次续期都包装成独立的在途任务（asyncio.Task）。
+    等待该任务的请求协程被取消（例如同步轮被中止）时，任务本身继续
+    运行：任务一旦完成就通过 done 回调把新令牌落进网关状态，随后任何
+    来源、任何轮次都能直接复用；同一失效世代的续期任务最多创建一个。
+    """
 
     def __init__(
         self,
@@ -159,27 +168,78 @@ class SharedGateway:
         self._token: str | None = None
         self._generation = 0          # 令牌世代，续期一次 +1
         self._renewed_generation: set[int] = set()
+        # 在途的首次签发 / 各失效世代续期任务；取消等待者不会取消任务
+        self._issuing_task: asyncio.Task[str] | None = None
+        self._renewal_tasks: dict[int, asyncio.Task[str]] = {}
+
+    def _spawn_issue_task(self) -> asyncio.Task[str]:
+        task = asyncio.ensure_future(self._token_provider())
+
+        def _adopt_issue(done: asyncio.Task[str]) -> None:
+            # 事件循环单线程内的普通属性写，无需加锁；任务只完成一次
+            if self._issuing_task is done:
+                self._issuing_task = None
+            if done.cancelled() or done.exception() is not None:
+                return
+            token = done.result()
+            if self._token is None:
+                self._token = token
+                self._generation += 1
+
+        task.add_done_callback(_adopt_issue)
+        return task
 
     async def _current_token(self) -> tuple[str, int]:
         async with self._token_lock:
+            if self._token is not None:
+                return self._token, self._generation
+            # 首次取令牌；续期请求本身也占额度，由调用方先占坑，
+            # provider 内部不再 acquire。在途签发任务可跨取消复用。
+            if self._issuing_task is None or self._issuing_task.done():
+                self._issuing_task = self._spawn_issue_task()
+            task = self._issuing_task
+        # shield：等待者被取消（同步轮中止）不得连带取消在途签发任务
+        token = await asyncio.shield(task)
+        async with self._token_lock:
+            # 极端情况下回调还没跑（同批次回调顺序），以结果为准
             if self._token is None:
-                # 首次取令牌；续期请求本身也占额度，由调用方先占坑，
-                # 这里直接走 provider（provider 内部不再 acquire）。
-                self._token = await self._token_provider()
+                self._token = token
                 self._generation += 1
             return self._token, self._generation
+
+    def _spawn_renewal_task(self, failed_generation: int) -> asyncio.Task[str]:
+        task = asyncio.ensure_future(self._token_provider())
+
+        def _adopt_renewal(done: asyncio.Task[str], gen: int = failed_generation) -> None:
+            if self._renewal_tasks.get(gen) is done:
+                self._renewal_tasks.pop(gen, None)
+            if done.cancelled() or done.exception() is not None:
+                # 失败不留标记：后续请求允许为该世代重新发起续期
+                self._renewed_generation.discard(gen)
+                return
+            new_token = done.result()
+            self._token = new_token
+            self._generation += 1
+            self._renewed_generation.add(gen)
+
+        task.add_done_callback(_adopt_renewal)
+        return task
 
     async def _renew_token(self, failed_generation: int) -> str:
         async with self._token_lock:
             if failed_generation in self._renewed_generation:
-                # 该世代令牌已经续期过，直接用当前新令牌，不重复续期
+                # 该世代令牌已经续期过（可能由上一轮在途任务完成），
+                # 直接用当前新令牌，不重复续期
                 assert self._token is not None
                 return self._token
-            new_token = await self._token_provider()
-            self._token = new_token
-            self._generation += 1
-            self._renewed_generation.add(failed_generation)
-            return new_token
+            existing = self._renewal_tasks.get(failed_generation)
+            if existing is None or existing.done():
+                existing = self._spawn_renewal_task(failed_generation)
+                self._renewal_tasks[failed_generation] = existing
+            task = existing
+        # 锁外等待，并 shield：等待者被取消不影响在途续期任务，
+        # 任务完成后由 done 回调把新令牌纳入网关，供后续轮次复用
+        return await asyncio.shield(task)
 
     async def request(
         self,

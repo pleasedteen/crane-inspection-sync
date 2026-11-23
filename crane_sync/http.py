@@ -76,12 +76,19 @@ class HttpClient:
         self, url: str, params: dict | None = None, token: str | None = None
     ) -> dict[str, Any]:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self._executor, self._blocking_get, url, params or {}, token
+        # shield：等待方（如被中止的同步轮）被取消时，线程池里在途的
+        # HTTP 调用不被连带取消，其结果仍可被在途令牌任务或后续轮次复用
+        return await asyncio.shield(
+            loop.run_in_executor(
+                self._executor, self._blocking_get, url, params or {}, token
+            )
         )
 
     async def post(self, url: str, payload: dict) -> dict[str, Any]:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self._executor, self._blocking_post, url, payload
+        # 同上：在途的令牌签发/续期 POST 必须能跨过取消继续完成
+        return await asyncio.shield(
+            loop.run_in_executor(
+                self._executor, self._blocking_post, url, payload
+            )
         )

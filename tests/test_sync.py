@@ -66,6 +66,27 @@ def admin_stats(base_url: str) -> dict:
         return json.loads(r.read().decode())
 
 
+def admin_post(base_url: str, path: str, payload: dict | None = None) -> dict:
+    data = json.dumps(payload or {}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base_url}{path}", data=data, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return json.loads(r.read().decode())
+
+
+async def wait_until(predicate, timeout: float = 5.0, interval: float = 0.02) -> None:
+    """轮询直到 predicate() 为真，超时抛出 AssertionError。"""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(interval)
+    raise AssertionError("等待条件未在超时内满足")
+
+
 def unique_order_count(rows: list[dict]) -> int:
     """已发布快照每个单号只保留最高修订，故条数=唯一单号数。"""
     return len({r["order_id"] for r in rows})
@@ -96,6 +117,119 @@ class UnitNormalizationTests(unittest.TestCase):
     def test_unknown_unit_rejected(self):
         with self.assertRaises(ValueError):
             normalize_gap(1, "inch")
+
+
+class LimiterGatewayUnitTests(unittest.TestCase):
+    """额度队列取消清理与共享令牌在途续期去重的单元级验证。"""
+
+    def test_quota_cancelled_waiter_does_not_leak_queue(self):
+        from crane_sync.limits import WindowQuota
+
+        quota = WindowQuota(limit=1, window_seconds=10.0)
+
+        async def scenario():
+            # 占满唯一额度
+            await quota.acquire("holder")
+            # 两个来源排队等待，随后取消
+            waiter = asyncio.ensure_future(quota.acquire("cancelled-src"))
+            await asyncio.sleep(0.05)
+            self.assertIn("cancelled-src", quota._waiting)
+            waiter.cancel()
+            try:
+                await waiter
+            except asyncio.CancelledError:
+                pass
+            # 排队痕迹必须被清理，否则该来源会被永久记为等待者
+            self.assertNotIn("cancelled-src", quota._waiting)
+            self.assertEqual(quota._waiting, {})
+
+        asyncio.run(scenario())
+
+    def test_same_generation_renewed_once_even_across_cancellation(self):
+        from crane_sync.limits import CooldownGate, SharedGateway, WindowQuota
+
+        async def scenario():
+            issued = {"count": 0}
+            renewed = asyncio.Event()
+            release = asyncio.Event()
+
+            async def provider():
+                # 模拟在途续期挂起，等待测试显式放行
+                issued["count"] += 1
+                if issued["count"] >= 2:
+                    renewed.set()
+                    await release.wait()
+                return f"tok-{issued['count']}"
+
+            gateway = SharedGateway(
+                WindowQuota(100, 10.0), CooldownGate(), provider
+            )
+            # 首次签发
+            token, gen1 = await gateway._current_token()
+            self.assertEqual((token, gen1), ("tok-1", 1))
+
+            # 两个来源同时为世代 1 触发续期，其中一个等待者随即被取消
+            first = asyncio.ensure_future(gateway._renew_token(gen1))
+            await wait_until(renewed.is_set)
+            second = asyncio.ensure_future(gateway._renew_token(gen1))
+            await asyncio.sleep(0.05)
+            second.cancel()
+            try:
+                await second
+            except asyncio.CancelledError:
+                pass
+            # 取消等待者不得取消在途续期任务
+            self.assertEqual(issued["count"], 2)
+            self.assertEqual(set(gateway._renewal_tasks), {gen1})
+
+            # 放行在途任务：新令牌经完成回调进入网关
+            release.set()
+            new_token = await first
+            self.assertEqual(new_token, "tok-2")
+            await asyncio.sleep(0)  # 让 done 回调执行
+            self.assertEqual(gateway._token, "tok-2")
+            self.assertEqual(gateway._generation, 2)
+            self.assertIn(gen1, gateway._renewed_generation)
+
+            # 下一轮（模拟重跑）再为世代 1 请求续期：直接复用，不再发请求
+            reused = await gateway._renew_token(gen1)
+            self.assertEqual(reused, "tok-2")
+            self.assertEqual(issued["count"], 2)
+
+        asyncio.run(scenario())
+
+    def test_failed_renewal_allows_retry_once(self):
+        from crane_sync.limits import CooldownGate, SharedGateway, WindowQuota
+
+        async def scenario():
+            calls = {"n": 0}
+
+            async def provider():
+                # 首次签发成功；世代 1 的第一次续期失败，第二次成功
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    raise RuntimeError("网关暂时不可用")
+                return f"tok-{calls['n']}"
+
+            gateway = SharedGateway(
+                WindowQuota(100, 10.0), CooldownGate(), provider
+            )
+            token, gen = await gateway._current_token()
+            self.assertEqual((token, gen), ("tok-1", 1))
+
+            bad = asyncio.ensure_future(gateway._renew_token(gen))
+            with self.assertRaises(RuntimeError):
+                await bad
+            await asyncio.sleep(0)  # 让 done 回调清理失败标记
+            self.assertNotIn(gen, gateway._renewed_generation)
+            self.assertNotIn(gen, gateway._renewal_tasks)
+
+            again = await gateway._renew_token(gen)
+            self.assertEqual(again, "tok-3")
+            self.assertEqual(gateway._generation, 2)
+            self.assertIn(gen, gateway._renewed_generation)
+
+        asyncio.run(scenario())
 
 
 class EndToEndTests(unittest.TestCase):
@@ -480,6 +614,335 @@ class EndToEndTests(unittest.TestCase):
         finally:
             server.shutdown()
             tmp.cleanup()
+
+
+class MultiRoundSessionTests(unittest.TestCase):
+    """同一引擎多轮运行、取消后立即重跑、在途请求挂起场景。"""
+
+    def setUp(self):
+        self.server = start_server()
+        self.base_url = (
+            f"http://{self.server.server_address[0]}:{self.server.server_address[1]}"
+        )
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state_dir = self.tmp.name
+
+    def tearDown(self):
+        # 放行所有可能仍挂起的请求，避免线程泄漏干扰后续用例
+        self.server.hang.release()
+        self.server.shutdown()
+        self.tmp.cleanup()
+
+    def test_same_engine_runs_multiple_rounds_in_one_loop(self):
+        # 回归：旧实现每轮 run() 都 shutdown 执行器，第二轮必然 RuntimeError
+        engine = SyncEngine(make_config(self.base_url, self.state_dir))
+        try:
+            async def scenario():
+                first = await engine.run()
+                second = await engine.run()
+                return first, second
+
+            first, second = asyncio.run(scenario())
+        finally:
+            engine.close()
+
+        self.assertEqual(set(first), {"offset", "cursor", "window"})
+        self.assertEqual(set(second), {"offset", "cursor", "window"})
+        # 第二轮是完整重跑：每源都发布了新的快照
+        for name in ("offset", "cursor", "window"):
+            self.assertNotEqual(
+                first[name]["snapshot_id"], second[name]["snapshot_id"]
+            )
+            self.assertEqual(
+                second[name]["record_count"], first[name]["record_count"]
+            )
+
+    def test_cancel_rerun_keeps_quota_cooldown_and_checkpoint(self):
+        # 紧额度必然出现真实 429 冷却；取消后立即重跑，验证额度窗口、
+        # 冷却状态与已落盘续点全部沿用同一套对象/数据。
+        server = start_server(gateway_quota=3, gateway_window=1.0)
+        base_url = (
+            f"http://{server.server_address[0]}:{server.server_address[1]}"
+        )
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            cfg = make_config(
+                base_url, tmp.name, gateway_quota=3, gateway_window=1.0
+            )
+            engine = SyncEngine(cfg)
+            saved_offset_holder: dict[str, int] = {}
+            try:
+                async def scenario():
+                    quota = engine.gateway.quota
+                    cooldown = engine.gateway.cooldown
+                    saw_cooldown = {"value": False}
+
+                    # 第一轮：offset 两页后中止；小额度下其他来源的请求
+                    # 被 429 拒绝时会把冷却写进共享 CooldownGate
+                    async def abort_after_two(source, pages):
+                        if cooldown.remaining() > 0:
+                            saw_cooldown["value"] = True
+                        if source == "offset" and pages >= 2:
+                            raise AbortSync("中止第一轮")
+
+                    engine.config.on_page = abort_after_two
+                    with self.assertRaises(AbortSync):
+                        await engine.run()
+
+                    # 取消后额度窗口里已有发放记录，且对象就是同一个
+                    self.assertGreater(len(quota._hits), 0)
+                    self.assertTrue(
+                        saw_cooldown["value"],
+                        "紧额度下本轮应实际观察到 429 冷却",
+                    )
+
+                    storage = Storage(tmp.name)
+                    try:
+                        checkpoint = storage.get_progress("offset")
+                    finally:
+                        storage.close()
+                    self.assertIsNotNone(checkpoint)
+                    saved_offset = checkpoint["next_offset"]
+                    self.assertEqual(saved_offset, 20)  # 两页 * page_size 10
+                    saved_offset_holder["value"] = saved_offset
+
+                    # 立即重跑：同一引擎、同一事件循环、同一套限额对象
+                    engine.config.on_page = None
+                    results = await engine.run()
+                    self.assertIs(engine.gateway.quota, quota)
+                    self.assertIs(engine.gateway.cooldown, cooldown)
+                    return results
+
+                results = asyncio.run(scenario())
+            finally:
+                engine.close()
+
+            unique_sizes = {
+                k: unique_order_count(v)
+                for k, v in server.gateway.datasets.items()
+            }
+            for name, info in results.items():
+                self.assertEqual(info["record_count"], unique_sizes[name])
+            # 续点有效：重跑不会再从头请求 offset=0
+            offsets = server.hang.snapshot()["offset_params"]
+            self.assertNotIn(0, offsets[1:])
+            self.assertIn(saved_offset_holder["value"], offsets)
+        finally:
+            server.hang.release()
+            server.shutdown()
+            tmp.cleanup()
+
+    def test_hung_pagination_does_not_block_other_sources_or_rerun(self):
+        engine = SyncEngine(
+            make_config(self.base_url, self.state_dir, http_timeout=30.0)
+        )
+        try:
+            async def scenario():
+                # 让 offset 的下一页请求在服务端挂起（挂起不占网关额度）
+                async def arm_hang(source, pages):
+                    if source == "offset" and pages == 1:
+                        await asyncio.get_running_loop().run_in_executor(
+                            None,
+                            lambda: admin_post(
+                                self.base_url,
+                                "/mock/admin/hang",
+                                {"path": "/offset/orders", "count": 1},
+                            ),
+                        )
+
+                engine.config.on_page = arm_hang
+                run_task = asyncio.ensure_future(engine.run())
+
+                # 等待 offset 请求真正进入挂起
+                await wait_until(lambda: self.server.hang.waiting() >= 1)
+
+                storage = Storage(self.state_dir)
+                try:
+                    progress_before = storage.get_progress("offset")
+                finally:
+                    storage.close()
+                self.assertIsNotNone(progress_before)
+
+                # 取消整个 run：旧轮任务被 drain，挂起的旧分页留在服务端
+                run_task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await run_task
+
+                # 取消后旧轮不再派发 offset 请求
+                calls_at_cancel = self.server.hang.snapshot()["path_calls"].get(
+                    "/offset/orders", 0
+                )
+                await asyncio.sleep(0.15)
+                self.assertEqual(
+                    self.server.hang.snapshot()["path_calls"].get(
+                        "/offset/orders", 0
+                    ),
+                    calls_at_cancel,
+                )
+                # 旧轮也没有再落盘（offset 进度停在取消前的值，且未发布）
+                storage = Storage(self.state_dir)
+                try:
+                    self.assertEqual(
+                        storage.get_progress("offset"), progress_before
+                    )
+                    self.assertNotIn("offset", storage.published_sources())
+                finally:
+                    storage.close()
+
+                # 立即重跑：挂起的旧分页不阻塞新轮，cursor/window 可先行
+                engine.config.on_page = None
+                results = await engine.run()
+                return results
+
+            results = asyncio.run(scenario())
+        finally:
+            engine.close()
+
+        unique_sizes = {
+            k: unique_order_count(v)
+            for k, v in self.server.gateway.datasets.items()
+        }
+        for name, info in results.items():
+            self.assertEqual(info["record_count"], unique_sizes[name])
+        # 重跑沿用续点：取消前已完成第一页（offset=10），重跑不会再请求 offset=0
+        offsets = self.server.hang.snapshot()["offset_params"]
+        self.assertEqual(offsets[0], 0)
+        self.assertNotIn(0, offsets[1:])
+        # 旧的挂起请求最终被放行过（tearDown/重跑过程中），且没有产生重复续点请求
+        self.assertEqual(offsets.count(0), 1)
+
+    def test_task_cancel_then_immediate_rerun_completes(self):
+        # 不借助挂起：直接从外部 cancel run() 协程，引擎必须能立即重跑。
+        engine = SyncEngine(make_config(self.base_url, self.state_dir))
+        try:
+            async def scenario():
+                async def cancel_soon(source, pages):
+                    if source == "offset" and pages >= 1:
+                        # 在下一个事件循环节拍从外部取消本轮 run
+                        task.cancel()
+
+                engine.config.on_page = cancel_soon
+                task = asyncio.ensure_future(engine.run())
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+                # 引擎已解锁，可立即开始下一轮
+                self.assertFalse(engine._running)
+                engine.config.on_page = None
+                results = await engine.run()
+                return results
+
+            results = asyncio.run(scenario())
+        finally:
+            engine.close()
+
+        unique_sizes = {
+            k: unique_order_count(v)
+            for k, v in self.server.gateway.datasets.items()
+        }
+        for name, info in results.items():
+            self.assertEqual(info["record_count"], unique_sizes[name])
+        storage = Storage(self.state_dir)
+        try:
+            self.assertEqual(
+                set(storage.published_sources()),
+                {"offset", "cursor", "window"},
+            )
+        finally:
+            storage.close()
+
+    def test_hung_token_renewal_reused_after_cancel_rerun(self):
+        # 第一轮：第一页后强制令牌失效，并让 401 触发的续期请求挂起；
+        # 取消后立即重跑——在途续期完成后必须被新轮复用，同一失效令牌
+        # 整个过程只续期一次。
+        engine = SyncEngine(
+            make_config(self.base_url, self.state_dir, http_timeout=30.0)
+        )
+        try:
+            async def scenario():
+                armed = {"done": False}
+
+                async def expire_and_hang(source, pages):
+                    if armed["done"]:
+                        return
+                    armed["done"] = True
+                    loop = asyncio.get_running_loop()
+
+                    def _admin():
+                        admin_post(
+                            self.base_url, "/mock/admin/expire-token"
+                        )
+                        admin_post(
+                            self.base_url,
+                            "/mock/admin/hang",
+                            {"path": "/gateway/token", "count": 1},
+                        )
+
+                    await loop.run_in_executor(None, _admin)
+
+                engine.config.on_page = expire_and_hang
+                run_task = asyncio.ensure_future(engine.run())
+
+                # 等待续期 POST 在服务端挂起
+                await wait_until(
+                    lambda: self.server.hang.snapshot()["path_calls"].get(
+                        "/gateway/token", 0
+                    ) >= 2  # 初次签发 + 一次续期
+                )
+                await wait_until(lambda: self.server.hang.waiting() >= 1)
+
+                renewals_at_cancel = admin_stats(self.base_url)["gateway"][
+                    "renewals"
+                ]
+                # 此刻只有初次签发完成，续期还挂着
+                self.assertEqual(renewals_at_cancel, 1)
+                old_generation = engine.gateway._generation
+
+                # 取消：续期任务不在取消范围内，继续在途
+                run_task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await run_task
+
+                # 立即重跑（先不释放挂起）：新轮等待同一个在途续期，
+                # 不会自己再发一个 token POST
+                engine.config.on_page = None
+                rerun = asyncio.ensure_future(engine.run())
+                await asyncio.sleep(0.2)
+                token_calls_before_release = self.server.hang.snapshot()[
+                    "path_calls"
+                ].get("/gateway/token", 0)
+                self.assertFalse(rerun.done(), "续期挂起期间重跑应继续等待")
+
+                # 放行：在途续期落地，重跑直接复用新令牌跑完全程
+                await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: admin_post(self.base_url, "/mock/admin/release")
+                )
+                results = await rerun
+
+                # 整个过程：初次签发 1 次 + 同一失效世代续期 1 次
+                stats = admin_stats(self.base_url)
+                self.assertEqual(stats["gateway"]["renewals"], 2)
+                self.assertEqual(
+                    self.server.hang.snapshot()["path_calls"].get(
+                        "/gateway/token", 0
+                    ),
+                    token_calls_before_release,
+                )
+                # 网关状态已被在途任务的完成回调更新
+                self.assertEqual(engine.gateway._generation, old_generation + 1)
+                self.assertIn(old_generation, engine.gateway._renewed_generation)
+                return results
+
+            results = asyncio.run(scenario())
+        finally:
+            engine.close()
+
+        unique_sizes = {
+            k: unique_order_count(v)
+            for k, v in self.server.gateway.datasets.items()
+        }
+        for name, info in results.items():
+            self.assertEqual(info["record_count"], unique_sizes[name])
 
 
 class SubprocessCliTests(unittest.TestCase):

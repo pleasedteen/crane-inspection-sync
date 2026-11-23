@@ -25,6 +25,79 @@ from urllib.parse import parse_qs, urlparse
 
 
 # ----------------------------------------------------------------------
+# 响应挂起控制（测试辅助）
+# ----------------------------------------------------------------------
+class HangControl:
+    """按路由前缀让响应在服务端挂起，用于复现"在途请求中的取消重跑"。
+
+    - arm(path, count): 接下来前 count 个匹配 path 的请求阻塞，
+      后续请求放行；可反复 arm（每次 arm 使用全新的 Event）。
+    - release(): 放行当前所有挂起请求（不改变剩余挂起配额，下一个
+      匹配请求仍会进入新的挂起）。
+    - waiting(): 当前被挂起的请求数。
+    挂起发生在任何额度/令牌校验之前，因此不会消耗网关额度。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._armed: dict[str, int] = {}
+        self._events: list[threading.Event] = []
+        self._total_hung = 0
+        self._waiting = 0
+        self._path_calls: dict[str, int] = {}
+        # 观测用：offset 源各次请求携带的 offset 参数
+        self.offset_params: list[int] = []
+
+    def arm(self, path: str, count: int) -> None:
+        with self._lock:
+            self._armed[path] = self._armed.get(path, 0) + count
+            self._events.append(threading.Event())
+
+    def release(self) -> int:
+        with self._lock:
+            events = list(self._events)
+        for event in events:
+            event.set()
+        return len(events)
+
+    def maybe_hang(self, path: str) -> None:
+        with self._lock:
+            self._path_calls[path] = self._path_calls.get(path, 0) + 1
+            remaining = self._armed.get(path, 0)
+            if remaining <= 0:
+                return
+            self._armed[path] = remaining - 1
+            self._total_hung += 1
+            self._waiting += 1
+            events = list(self._events)
+        try:
+            # 锁外等待，不阻塞其他请求与 admin 操作
+            for event in events:
+                event.wait()
+        finally:
+            with self._lock:
+                self._waiting -= 1
+
+    def waiting(self) -> int:
+        with self._lock:
+            return self._waiting
+
+    def record_offset(self, offset: int) -> None:
+        with self._lock:
+            self.offset_params.append(offset)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "armed": dict(self._armed),
+                "total_hung": self._total_hung,
+                "waiting": self._waiting,
+                "path_calls": dict(self._path_calls),
+                "offset_params": list(self.offset_params),
+            }
+
+
+# ----------------------------------------------------------------------
 # 模拟数据生成
 # ----------------------------------------------------------------------
 def _iso(dt: datetime) -> str:
@@ -241,6 +314,13 @@ class _Handler(BaseHTTPRequestHandler):
         path = parsed.path
         qs = {k: v[0] for k, v in parse_qs(parsed.query).items()}
         try:
+            if path == "/mock/admin/stats":
+                return self._send_json(200, self.state.admin_stats())
+            if path == "/mock/admin/hang":
+                return self._admin_hang(qs)
+            # 挂起点在任何额度/令牌校验之前：挂起不占额度，取消重跑时
+            # 旧分页被挂住也不会消耗后续轮次的额度
+            self.state.hang.maybe_hang(path)
             if path == "/offset/orders":
                 return self._handle_offset(qs)
             if path == "/cursor/manifest":
@@ -249,15 +329,26 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._handle_cursor_orders(qs)
             if path == "/window/orders":
                 return self._handle_window(qs)
-            if path == "/mock/admin/stats":
-                return self._send_json(200, self.state.admin_stats())
             self._send_json(404, {"error": "not found", "path": path})
         except Exception as exc:  # 模拟源自身不应崩溃
             self._send_json(500, {"error": f"mock failure: {exc}"})
 
     def do_POST(self):  # noqa: N802
         parsed = urlparse(self.path)
+        if parsed.path == "/mock/admin/hang":
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                payload = json.loads(raw or b"{}")
+            except json.JSONDecodeError:
+                payload = {}
+            return self._admin_hang(payload)
+        if parsed.path == "/mock/admin/release":
+            released = self.state.hang.release()
+            return self._send_json(200, {"released": released})
         if parsed.path == "/gateway/token":
+            # 令牌续期也可以挂起，验证"在途续期取消后仍可被下轮复用"
+            self.state.hang.maybe_hang("/gateway/token")
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length) if length else b"{}"
             try:
@@ -285,6 +376,14 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send_json(200, {"expired": True})
         self._send_json(404, {"error": "not found", "path": parsed.path})
 
+    def _admin_hang(self, params: dict):
+        path = params.get("path")
+        count = int(params.get("count", 1))
+        if not path:
+            return self._send_json(400, {"error": "path required"})
+        self.state.hang.arm(path, count)
+        return self._send_json(200, {"armed": path, "count": count})
+
     # ---------------- 三个来源 ----------------
     def _handle_offset(self, qs: dict):
         if not self._gateway_authorized():
@@ -292,6 +391,7 @@ class _Handler(BaseHTTPRequestHandler):
         rows = self.state.gateway.datasets["offset"]
         limit = int(qs.get("limit", 10))
         offset = int(qs.get("offset", 0))
+        self.state.hang.record_offset(offset)
         page = rows[offset : offset + limit]
         self._send_json(
             200,
@@ -409,6 +509,7 @@ class MockServer(ThreadingHTTPServer):
         )
         self.window_quota = SlidingWindow(window_quota, window_window)
         self.window_rejected = 0
+        self.hang = HangControl()
 
     def admin_stats(self) -> dict:
         ds = self.gateway.datasets
@@ -417,6 +518,7 @@ class MockServer(ThreadingHTTPServer):
             "window_rejected_429": self.window_rejected,
             "dataset_sizes": {k: len(v) for k, v in ds.items()},
             "cursor_version": self.gateway.cursor_version,
+            "hang": self.hang.snapshot(),
         }
 
 
