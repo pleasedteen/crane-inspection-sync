@@ -4,17 +4,21 @@
 
 - /offset/**     偏移分页源（?limit=&offset=），走共享网关令牌
 - /cursor/**     游标分页源（清单版次 + 游标），走共享网关令牌
-- /window/**     时间窗分页源（?from=&to=），独立额度，无需令牌
+- /window/**     时间窗分页源（?from=&to=）+ 迟到变更流（/window/changes），独立额度
 - /gateway/token POST 取/续共享令牌（续期使旧令牌失效，且占用额度）
-- /mock/admin/** 测试辅助：强制令牌过期、轮换游标清单、查看计数
+- /mock/admin/** 测试辅助：强制令牌过期、轮换游标清单、注入时间窗变更、查看计数
 
 游标语义：游标属于某一版清单，清单过期后旧游标返回 410，
 客户端只能从新版清单开头重读；新版的记录集合与顺序都可能变化。
 时间窗语义：相邻窗口在边界上重叠，同一条边界记录会被两个窗口重复返回；
 同一 inspected_at 时刻允许存在多张单。
+变更流语义：时间窗供应商会对"旧巡检单的某个修订"补发、更正或撤回，
+这些迟到变更通过 /window/changes 按递增序号发布，客户端只需从续点
+追赶变更，无需重扫历史时间窗；变更日志超出保留范围后旧续点返回 410。
 """
 from __future__ import annotations
 
+import copy
 import json
 import threading
 import time
@@ -80,6 +84,133 @@ def build_datasets(seed: int = 20261118) -> dict:
 
 
 # ----------------------------------------------------------------------
+# 时间窗变更流（补发 / 更正 / 撤回）
+# ----------------------------------------------------------------------
+class WindowChangeLog:
+    """时间窗源当前状态 + 递增变更日志。
+
+    供应商会针对"旧巡检单的某个修订"发布三类迟到变更：
+
+    - ``append``：补发一个新修订（单号/修订此前不存在）
+    - ``correct``：更正某个已有修订的读数（单号/修订不变）
+    - ``retract``：撤回某个修订（该修订从当前状态中消失）
+
+    变更按全局递增序号 seq 发布；客户端保存已消费到的 seq 作为续点，
+    只需追赶后续变更，无需重扫历史时间窗。日志可配置保留条数，
+    续点早于保留范围时返回 410，客户端须重建基线。
+    """
+
+    TYPES = ("append", "correct", "retract")
+
+    def __init__(self, rows: list[dict], retention: int | None = None):
+        self.retention = retention if retention and retention > 0 else None
+        self._lock = threading.Lock()
+        self._rows: dict[tuple[str, int], dict] = {
+            (r["order_id"], int(r["revision"])): copy.deepcopy(r) for r in rows
+        }
+        self._log: list[dict] = []
+        self._seq = 0
+
+    # ---- 当前状态 ----
+    def rows(self) -> list[dict]:
+        with self._lock:
+            return [copy.deepcopy(r) for r in self._rows.values()]
+
+    def row_count(self) -> int:
+        with self._lock:
+            return len(self._rows)
+
+    # ---- 变更日志 ----
+    @property
+    def high_watermark(self) -> int:
+        with self._lock:
+            return self._seq
+
+    @property
+    def oldest_seq(self) -> int:
+        """日志中仍可读到的最早序号；日志为空时为 high_watermark+1。"""
+        with self._lock:
+            return self._log[0]["seq"] if self._log else self._seq + 1
+
+    def _record_event(self, etype: str, order_id: str, revision: int,
+                      row: dict | None) -> dict:
+        self._seq += 1
+        event = {
+            "seq": self._seq,
+            "type": etype,
+            "order_id": order_id,
+            "revision": revision,
+        }
+        if row is not None:
+            event["order"] = copy.deepcopy(row)
+        self._log.append(event)
+        if self.retention is not None:
+            while len(self._log) > self.retention:
+                self._log.pop(0)
+        return copy.deepcopy(event)
+
+    def apply(self, change: dict) -> dict:
+        """注入一条变更并更新当前状态，返回带 seq 的事件。"""
+        etype = change.get("type")
+        if etype not in self.TYPES:
+            raise ValueError(f"未知变更类型: {etype!r}")
+        order_id = str(change["order_id"])
+        revision = int(change["revision"])
+        key = (order_id, revision)
+        with self._lock:
+            if etype == "retract":
+                self._rows.pop(key, None)
+                return self._record_event("retract", order_id, revision, None)
+            if etype == "append" and key in self._rows:
+                raise ValueError(f"{order_id} rev{revision} 已存在，补发会冲突")
+            if etype == "correct" and key not in self._rows:
+                raise ValueError(f"{order_id} rev{revision} 不存在，无法更正")
+            row = {
+                "order_id": order_id,
+                "revision": revision,
+                "inspected_at": str(change["inspected_at"]),
+                "gaps": copy.deepcopy(change.get("gaps", [])),
+            }
+            self._rows[key] = row
+            return self._record_event(etype, order_id, revision, row)
+
+    def changes_since(self, since: int, until: int, limit: int) -> dict:
+        """返回 (since, until] 内的变更页；续点早于保留范围时由调用方处理。"""
+        with self._lock:
+            oldest = self._log[0]["seq"] if self._log else self._seq + 1
+            if since < oldest - 1:
+                raise _ChangeCursorExpired(since=since, oldest_seq=oldest)
+            cap = min(until, self._seq)
+            pending = [e for e in self._log if since < e["seq"] <= cap]
+            page = pending[:limit]
+            next_since = page[-1]["seq"] if page else max(since, cap)
+            has_more = bool(pending[limit:])
+            return {
+                "changes": copy.deepcopy(page),
+                "next_since": next_since,
+                "has_more": has_more,
+                "high_watermark": self._seq,
+            }
+
+    def manifest(self) -> dict:
+        with self._lock:
+            return {
+                "high_watermark": self._seq,
+                "oldest_seq": self._log[0]["seq"] if self._log else self._seq + 1,
+                "retention": self.retention,
+            }
+
+
+class _ChangeCursorExpired(Exception):
+    def __init__(self, since: int, oldest_seq: int):
+        super().__init__(
+            f"change cursor {since} is older than retention {oldest_seq}"
+        )
+        self.since = since
+        self.oldest_seq = oldest_seq
+
+
+# ----------------------------------------------------------------------
 # 服务端额度与令牌状态
 # ----------------------------------------------------------------------
 class SlidingWindow:
@@ -109,6 +240,7 @@ class GatewayState:
         token_ttl: float,
         cursor_rotate_after: int | None,
         datasets: dict,
+        window_change_retention: int | None = None,
     ):
         self.quota = SlidingWindow(quota_limit, quota_window)
         self.token_ttl = token_ttl
@@ -122,6 +254,10 @@ class GatewayState:
         self._cursor_calls = 0
         self._cursor_rotate_after = cursor_rotate_after
         self.datasets = datasets
+        # 时间窗源：当前状态 + 迟到变更日志
+        self.window_log = WindowChangeLog(
+            datasets["window"], retention=window_change_retention
+        )
         self.stats = {"gateway_requests": 0, "renewals": 0, "rejected_429": 0}
 
     def _build_cursor_manifest(self, rows: list[dict], version: int) -> list[dict]:
@@ -249,6 +385,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._handle_cursor_orders(qs)
             if path == "/window/orders":
                 return self._handle_window(qs)
+            if path == "/window/changes":
+                return self._handle_window_changes(qs)
             if path == "/mock/admin/stats":
                 return self._send_json(200, self.state.admin_stats())
             self._send_json(404, {"error": "not found", "path": path})
@@ -283,6 +421,18 @@ class _Handler(BaseHTTPRequestHandler):
         if parsed.path == "/mock/admin/expire-token":
             self.state.gateway.force_token_expiry()
             return self._send_json(200, {"expired": True})
+        if parsed.path == "/mock/admin/window-change":
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                change = json.loads(raw or b"{}")
+            except json.JSONDecodeError:
+                return self._send_json(400, {"error": "invalid json"})
+            try:
+                event = self.state.gateway.window_log.apply(change)
+            except (KeyError, TypeError, ValueError) as exc:
+                return self._send_json(400, {"error": str(exc)})
+            return self._send_json(200, event)
         self._send_json(404, {"error": "not found", "path": parsed.path})
 
     # ---------------- 三个来源 ----------------
@@ -366,7 +516,9 @@ class _Handler(BaseHTTPRequestHandler):
                 {"error": "window source quota exhausted"},
                 {"Retry-After": round(retry, 3)},
             )
-        rows = self.state.gateway.datasets["window"]
+        self.state.window_scans += 1
+        # 数据来源是供应商"当前状态"，包含所有已补发/更正/撤回后的结果
+        rows = self.state.gateway.window_log.rows()
         frm = qs.get("from")
         to = qs.get("to")
         if not frm or not to:
@@ -383,6 +535,44 @@ class _Handler(BaseHTTPRequestHandler):
             },
         )
 
+    def _handle_window_changes(self, qs: dict):
+        """迟到变更流：只读变更日志，不重扫时间窗。"""
+        ok, retry = self.state.window_quota.allow()
+        if not ok:
+            self.state.window_rejected += 1
+            return self._send_json(
+                429,
+                {"error": "window source quota exhausted"},
+                {"Retry-After": round(retry, 3)},
+            )
+        self.state.window_change_pages += 1
+        log = self.state.gateway.window_log
+        if qs.get("manifest") is not None:
+            return self._send_json(200, log.manifest())
+        try:
+            since = int(qs.get("since", 0))
+            until = int(qs["until"]) if "until" in qs else log.high_watermark
+            limit = int(qs.get("limit", 100))
+        except (TypeError, ValueError):
+            return self._send_json(
+                400, {"error": "since/until/limit must be integers"}
+            )
+        try:
+            page = log.changes_since(since, until, limit)
+        except _ChangeCursorExpired as exc:
+            # 续点早于日志保留范围：客户端须重建基线
+            return self._send_json(
+                410,
+                {
+                    "error": "change cursor expired",
+                    "since": exc.since,
+                    "oldest_seq": exc.oldest_seq,
+                },
+            )
+        page["since"] = since
+        page["until"] = until
+        return self._send_json(200, page)
+
 
 class MockServer(ThreadingHTTPServer):
     daemon_threads = True
@@ -397,6 +587,7 @@ class MockServer(ThreadingHTTPServer):
         window_window: float,
         token_ttl: float,
         cursor_rotate_after: int | None,
+        window_change_retention: int | None = None,
     ):
         super().__init__(addr, _Handler)
         datasets = build_datasets()
@@ -406,17 +597,27 @@ class MockServer(ThreadingHTTPServer):
             token_ttl,
             cursor_rotate_after,
             datasets,
+            window_change_retention=window_change_retention,
         )
         self.window_quota = SlidingWindow(window_quota, window_window)
         self.window_rejected = 0
+        # 观测：全量时间窗扫描页数 vs 变更流页数
+        self.window_scans = 0
+        self.window_change_pages = 0
 
     def admin_stats(self) -> dict:
         ds = self.gateway.datasets
+        sizes = {k: len(v) for k, v in ds.items()}
+        # 时间窗源给的是"当前状态"，含补发/更正/撤回后的结果
+        sizes["window"] = self.gateway.window_log.row_count()
         return {
             "gateway": self.gateway.stats,
             "window_rejected_429": self.window_rejected,
-            "dataset_sizes": {k: len(v) for k, v in ds.items()},
+            "window_scans": self.window_scans,
+            "window_change_pages": self.window_change_pages,
+            "dataset_sizes": sizes,
             "cursor_version": self.gateway.cursor_version,
+            "window_change_watermark": self.gateway.window_log.high_watermark,
         }
 
 
@@ -429,6 +630,7 @@ def serve_forever(config: dict) -> MockServer:
         config.get("window_window", 5.0),
         config.get("token_ttl", 300.0),
         config.get("cursor_rotate_after"),
+        config.get("window_change_retention"),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

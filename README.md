@@ -19,9 +19,10 @@
 python3 run_tests.py
 ```
 
-实测约 22 秒完成 14 项测试，覆盖：毫米/微米归一、三源端到端发布、共享额度与
+实测约 28 秒完成 20 项测试，覆盖：毫米/微米归一、三源端到端发布、共享额度与
 令牌只续期一次、游标清单过期重读且旧快照可读、时间窗边界去重、强制中止后续跑、
-并发公平性、Parquet（有 pyarrow 时）以及真实子进程的 serve→sync→read 链路。
+并发公平性、Parquet（有 pyarrow 时）、真实子进程的 serve→sync→read 链路，以及
+时间窗源的迟到变更追赶（补发/更正/撤回、每轮上限、页级续跑、过期重建）。
 
 也可用标准 unittest：
 
@@ -44,6 +45,7 @@ python3 -m crane_sync serve --config-out mock.json --state-dir ./state --port 87
 | 偏移源 | `GET /offset/orders?limit=&offset=` | 偏移 | 共享网关令牌+额度 |
 | 游标源 | `GET /cursor/manifest`、`GET /cursor/orders?cursor=` | 清单游标 | 共享网关令牌+额度 |
 | 时间窗源 | `GET /window/orders?from=&to=` | 时间窗 | 独立额度，无令牌 |
+| 时间窗变更流 | `GET /window/changes?since=&until=&limit=` | 变更序号 | 独立额度，无令牌 |
 | 令牌 | `POST /gateway/token` | — | 续期同样占额度 |
 
 `--config-out` 会把连接参数写成 `mock.json`，供下一步使用。该命令常驻，
@@ -89,7 +91,9 @@ python3 -m crane_sync read --state-dir ./state --source offset
 - **游标源**：游标绑定清单版次。清单过期后旧游标返回 HTTP 410，客户端丢弃旧
   进度、清空该源旧暂存、从新版清单开头重读；新版清单的记录集合与顺序都可能变化，
   快照按清单行号（`position` 列）保序。**重读期间上一版已发布快照仍可正常读取**。
-- **时间窗源**：进度记录最后一个窗口的 `to`，重跑从此处继续。
+- **时间窗源**：首次同步（或基线失效）用时间窗全量扫描建立基线；进度记录最后
+  一个窗口的 `to`，重跑从此处继续。此后**日常追赶只读变更流，不重扫旧时间窗**，
+  详见下一节。
 
 ### 额度、冷却与令牌（`limits.py`）
 - 偏移源与游标源**共用**同一网关的滑动窗口额度和同一访问令牌；数据请求与令牌
@@ -111,6 +115,27 @@ python3 -m crane_sync read --state-dir ./state --source offset
 - **强制中止可重跑**：每读完一页进度即落盘，重跑时仍有效的分页从已保存进度续读；
   游标若已过期则按上面的 410 规则重读，已发布快照全程可读。
 
+### 时间窗变更追赶（迟到修订）
+供应商会针对**旧巡检单的某个修订**发布三类迟到变更：
+
+| 类型 | 含义 | 快照效果 |
+|------|------|----------|
+| `append` 补发 | 新增一个（单号, 修订） | 该修订入库参与折叠 |
+| `correct` 更正 | 改某已有修订的读数 | 覆盖暂存中的同名记录 |
+| `retract` 撤回 | 删除某个修订 | 从暂存删除；若撤回最高修订则快照回落到次高 |
+
+- **变更流 + 续点**：变更按全局递增序号 `seq` 发布于 `/window/changes`；客户端
+  保存已消费到的 `since` 作为续点，日常每轮只拉 `(since, until]` 的变更，
+  **不重扫历史时间窗**（`admin_stats` 的 `window_scans` 不再增长）。
+- **每轮上限**：每轮以启动时读取的变更高水位作为 `until`，只追到该上限；采完
+  （含分页续读）后一次性发布。启动之后才出现的变更留给下一轮，不会边采边漂移。
+- **页级续点**：每读完一页变更即保存 `since`；强制中止后重启从下一页继续，
+  **不重拉已保存的页面**，并沿用该轮开始时记录的 `until`。
+- **过期重建**：旧状态没有变更续点（老版本），或续点早于日志保留范围（HTTP 410）
+  时，清空该源暂存、按时间窗全量重扫建立新基线，再从日志补齐时间窗覆盖不到的
+  变化。**重建期间上一版已发布快照仍可读，其他来源照常采集与发布。**
+- 变更流与时间窗共用时间窗源的独立额度，不与网关（偏移/游标）互相阻塞。
+
 ## 五、目录结构
 
 ```
@@ -124,7 +149,7 @@ crane_sync/
   engine.py       异步并发编排三个来源
   cli.py          serve / sync / read 命令行
 tests/
-  test_sync.py    14 项自动化测试（含真实子进程链路）
+  test_sync.py    20 项自动化测试（含真实子进程链路、时间窗迟到变更追赶）
 run_tests.py      一键测试入口
 config.example.json
 requirements.txt
@@ -134,5 +159,11 @@ requirements.txt
 
 - `POST /mock/admin/expire-token`：强制当前令牌立即失效，用于验证 401 续期。
 - `POST /mock/admin/rotate-cursor`：把游标清单轮换到新版，用于验证 410 重读。
-- `GET  /mock/admin/stats`：查看网关请求数、续期次数、429 次数等。
+- `POST /mock/admin/window-change`：注入一条时间窗迟到变更，正文
+  `{"type":"append|correct|retract","order_id":...,"revision":...}`，
+  `append/correct` 还需 `inspected_at` 与 `gaps`；返回带 `seq` 的事件。
+- `GET  /mock/admin/stats`：查看网关请求数、续期次数、429 次数、时间窗全量扫描
+  页数（`window_scans`）与变更流页数（`window_change_pages`）等。
 - 启动参数 `--cursor-rotate-after N`：第 N 次游标调用后自动轮换清单。
+- 启动参数 `--window-change-retention N`：变更日志只保留最近 N 条；续点早于
+  保留范围时 `/window/changes` 返回 410，用于验证过期重建。

@@ -4,6 +4,9 @@
 - 每成功读完一页就把分页进度落盘（强制中止后可续读）；
 - 记录写入暂存表（按 来源+单号+修订号 去重，间隙已归一为毫米）；
 - 读完整轮清单后独立发布原子快照，发布后才对读者可见。
+
+时间窗采集器还支持"迟到变更追赶"：首次/基线失效时全量扫描时间窗，
+此后只从保存的变更续点追赶补发/更正/撤回，不再重扫旧时间窗。
 """
 from __future__ import annotations
 
@@ -220,11 +223,19 @@ class CursorFetcher(BaseFetcher):
 
 
 class WindowFetcher(BaseFetcher):
-    """时间窗分页源。
+    """时间窗分页源 + 迟到变更追赶。
 
-    相邻窗口闭区间重叠，边界记录会重复返回；同一时刻可有多张单。
-    进度记录最后成功窗口的 to；去重交给暂存表主键
-    （source+order_id+revision），重复记录自然被合并。
+    供应商会对旧巡检单的某个修订**补发 / 更正 / 撤回**。首次同步（或
+    基线失效时）用时间窗全量扫描建立基线；此后每轮只需从保存的变更续点
+    ``since`` 追赶变更日志，不再重扫历史时间窗。
+
+    - **每轮上限**：启动时读取变更高水位作为本轮 ``until``，只追到该上限，
+      采完（含分页续读）再一次性发布；上限之后的新变更留给下一轮。
+    - **页级续点**：每读完一页变更即保存 ``since``，重启后从下一页继续，
+      不重拉已保存的页面。未完成的一轮沿用其原 ``until``。
+    - **重建**：旧状态没有变更续点，或续点早于日志保留范围（HTTP 410）时，
+      清空该源暂存并全量重扫时间窗建立新基线。重建期间上一版已发布快照
+      仍可读，其他来源并发采集不受影响。
     """
 
     name = "window"
@@ -237,6 +248,7 @@ class WindowFetcher(BaseFetcher):
         limiter: IndependentLimiter,
         window_minutes: int = 30,
         horizon: str | None = None,
+        window_start: str | None = None,
         **kw,
     ):
         super().__init__(storage, client, base_url, **kw)
@@ -244,17 +256,171 @@ class WindowFetcher(BaseFetcher):
         self.window_minutes = window_minutes
         # 模拟源数据上界；实际项目中可由配置或探测接口给出
         self.horizon = horizon or "2026-11-12T00:00:00"
+        self.window_start = window_start or "2026-11-10T08:00:00"
         self._pages = 0
 
     def _add_minutes(self, iso_ts: str, minutes: int) -> str:
         dt = datetime.strptime(iso_ts, "%Y-%m-%dT%H:%M:%S")
         return (dt + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%S")
 
+    # ---------------- 公共入口 ----------------
     async def run(self) -> dict:
+        from .limits import StaleCursor
+
         progress = self.storage.get_progress(self.name) or {}
-        start = progress.get("last_to") or "2026-11-10T08:00:00"
+        mode = progress.get("mode")
+        if mode == "changes" and "since" in progress:
+            try:
+                return await self._run_changes(progress)
+            except StaleCursor as exc:
+                logger.warning(
+                    "[window] 变更续点已过期（%s），重建基线并全量重扫时间窗", exc
+                )
+                return await self._run_baseline({})
+        # 旧状态（无 mode/续点）或正在重建的基线
+        return await self._run_baseline(progress if mode == "baseline" else {})
+
+    # ---------------- 变更追赶 ----------------
+    async def _fetch_manifest(self) -> dict:
+        async def _send(_token):
+            return await self.client.get(
+                f"{self.base_url}/window/changes", {"manifest": 1}
+            )
+
+        return await self.limiter.request(_send, owner=self.name)
+
+    async def _fetch_watermark(self) -> int:
+        return int((await self._fetch_manifest())["high_watermark"])
+
+    async def _fetch_changes(self, since: int, until: int) -> dict:
+        async def _send(_token):
+            return await self.client.get(
+                f"{self.base_url}/window/changes",
+                {"since": since, "until": until, "limit": self.page_size},
+            )
+
+        return await self.limiter.request(_send, owner=self.name)
+
+    def _apply_changes(self, events: list[dict]) -> None:
+        """按序应用一页变更：撤回即时删除，补发/更正先收集再批量写入。
+
+        同一页内可能出现"先补发后撤回"等组合，因此严格保持日志顺序：
+        每次遇到需要写入的记录先 flush 之前的删除/写入批次，保证最终状态正确。
+        """
+        pending_writes: list[InspectionOrder] = []
+
+        def flush() -> None:
+            if pending_writes:
+                self.storage.upsert_records(self.name, list(pending_writes))
+                pending_writes.clear()
+
+        for event in events:
+            etype = event.get("type")
+            if etype == "retract":
+                flush()
+                self.storage.delete_record(
+                    self.name, str(event["order_id"]), int(event["revision"])
+                )
+            else:  # append / correct：都按键 upsert
+                pending_writes.append(
+                    InspectionOrder.from_payload(event["order"], self.name)
+                )
+        flush()
+
+    async def _run_changes(self, progress: dict) -> dict:
+        since = int(progress["since"])
+        if progress.get("done") is False and "until" in progress:
+            # 重启续跑未完成的一轮：沿用启动时记录的变更上限
+            until = int(progress["until"])
+            logger.info(
+                "[window] 续跑变更追赶：since=%s until=%s（沿用本轮上限）",
+                since, until,
+            )
+        else:
+            # 新一轮：以此刻的变更高水位为本轮上限
+            until = await self._fetch_watermark()
+            logger.info(
+                "[window] 开始新一轮变更追赶：since=%s until=%s（启动上限）",
+                since, until,
+            )
         self._pages = 0
-        logger.info("[window] 从时间窗起点 %s 开始（或续读）", start)
+        since = await self._drain_changes(since, until)
+        self.storage.set_progress(
+            self.name,
+            {"mode": "changes", "since": since, "until": until, "done": True},
+        )
+        info = self.storage.publish_snapshot(self.name, self.snapshot_format)
+        logger.info("[window] 已发布快照 %s（%s 条）", info["snapshot_id"],
+                    info["record_count"])
+        return info
+
+    async def _drain_changes(self, since: int, until: int) -> int:
+        """把 (since, until] 的变更分页追完；每页落盘续点，返回最终续点。"""
+        while True:
+            data = await self._fetch_changes(since, until)
+            self._apply_changes(data.get("changes", []))
+            next_since = int(data["next_since"])
+            done = not data.get("has_more", False)
+            self._pages += 1
+            self.storage.set_progress(
+                self.name,
+                {
+                    "mode": "changes",
+                    "since": next_since,
+                    "until": until,
+                    "done": done,
+                },
+            )
+            logger.info(
+                "[window] 变更第 %s 页：本页 %s 条，since=%s -> %s，%s",
+                self._pages, len(data.get("changes", [])), since, next_since,
+                "本轮追赶完成" if done else "继续下一页",
+            )
+            await self._page_hook()
+            since = next_since
+            if done:
+                return since
+
+    # ---------------- 基线（全量时间窗扫描） ----------------
+    async def _run_baseline(self, progress: dict) -> dict:
+        from .limits import StaleCursor
+
+        self._pages = 0
+        resuming = (
+            progress.get("last_to") is not None
+            and progress.get("baseline_until") is not None
+        )
+        if resuming:
+            # 中止后继续未完成的全量扫描，不重拉已保存的窗口
+            start = progress["last_to"]
+            until = int(progress["baseline_until"])
+            baseline_since = int(progress.get("baseline_since", 0) or 0)
+            logger.info(
+                "[window] 续跑基线扫描：从 %s 继续，基线上限 until=%s", start, until
+            )
+        else:
+            # 新建基线：旧暂存可能含已撤回的记录，先清空；
+            # 已发布快照在重新发布前始终可读
+            self.storage.clear_staging(self.name)
+            manifest = await self._fetch_manifest()
+            until = int(manifest["high_watermark"])
+            # 时间窗扫描只覆盖 [window_start, horizon]；更早/更晚被补发的记录
+            # 只能靠变更日志补齐。日志已滚出保留范围时只能从当前最早处开始。
+            baseline_since = max(0, int(manifest["oldest_seq"]) - 1)
+            start = self.window_start
+            self.storage.set_progress(
+                self.name,
+                {
+                    "mode": "baseline",
+                    "baseline_until": until,
+                    "baseline_since": baseline_since,
+                    "last_to": None,
+                    "done": False,
+                },
+            )
+            logger.info("[window] 建立基线：从 %s 全量扫描，基线上限 until=%s",
+                        start, until)
+
         while start <= self.horizon:
             end = self._add_minutes(start, self.window_minutes)
             frm, to = start, end
@@ -267,17 +433,46 @@ class WindowFetcher(BaseFetcher):
             data = await self.limiter.request(_send, owner=self.name)
             written = self._ingest(data.get("orders", []))
             self._pages += 1
+            start = end
+            done = start > self.horizon
             self.storage.set_progress(
-                self.name, {"last_to": to, "done": to >= self.horizon}
+                self.name,
+                {
+                    "mode": "baseline",
+                    "baseline_until": until,
+                    "baseline_since": baseline_since,
+                    "last_to": start,
+                    "done": done,
+                },
             )
             logger.info(
                 "[window] 窗口 [%s, %s] 完成，本页 %s 条，新增/更新 %s 条",
                 frm, to, data.get("count", 0), written,
             )
             await self._page_hook()
-            # 下一窗口与当前窗口首尾相接（闭区间天然重叠一条边界记录）
-            start = end
+
+        # 全量扫描已覆盖整个时间窗，但变更日志中还可能有时间窗覆盖不到的
+        # 变化（例如更早时间被补发的新修订、之后被撤回的旧修订）。从 0 追到
+        # 本轮上限，把基线补齐到"启动时的当前状态"：撤回正确删除、补发/更正
+        # 正确覆盖。上限之后的新变更留给下一轮。
+        since = baseline_since
+        try:
+            since = await self._drain_changes(since, until)
+        except StaleCursor:
+            # 基线扫描耗时较久，补齐阶段起点已滚出日志保留范围：
+            # 从当前仍可读的最早变更继续（更早的变化已被全量扫描覆盖）。
+            manifest = await self._fetch_manifest()
+            fallback = max(0, int(manifest["oldest_seq"]) - 1)
+            logger.warning(
+                "[window] 基线补齐续点已过期，改从 %s 继续补齐", fallback
+            )
+            since = await self._drain_changes(fallback, until)
+
+        self.storage.set_progress(
+            self.name,
+            {"mode": "changes", "since": since, "until": until, "done": True},
+        )
         info = self.storage.publish_snapshot(self.name, self.snapshot_format)
-        logger.info("[window] 已发布快照 %s（%s 条）", info["snapshot_id"],
-                    info["record_count"])
+        logger.info("[window] 基线完成并发布快照 %s（%s 条）",
+                    info["snapshot_id"], info["record_count"])
         return info

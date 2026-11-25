@@ -66,6 +66,17 @@ def admin_stats(base_url: str) -> dict:
         return json.loads(r.read().decode())
 
 
+def inject_window_change(base_url: str, change: dict) -> dict:
+    req = urllib.request.Request(
+        f"{base_url}/mock/admin/window-change",
+        data=json.dumps(change).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return json.loads(r.read().decode())
+
+
 def unique_order_count(rows: list[dict]) -> int:
     """已发布快照每个单号只保留最高修订，故条数=唯一单号数。"""
     return len({r["order_id"] for r in rows})
@@ -480,6 +491,292 @@ class EndToEndTests(unittest.TestCase):
         finally:
             server.shutdown()
             tmp.cleanup()
+
+
+class WindowChangeCatchUpTests(unittest.TestCase):
+    """时间窗源的迟到变更追赶：补发 / 更正 / 撤回、续跑、过期重建。"""
+
+    def setUp(self):
+        self.server = start_server()
+        self.base_url = (
+            f"http://{self.server.server_address[0]}:{self.server.server_address[1]}"
+        )
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state_dir = self.tmp.name
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.tmp.cleanup()
+
+    def _sync(self, **overrides) -> dict:
+        engine = SyncEngine(make_config(self.base_url, self.state_dir, **overrides))
+        try:
+            return asyncio.run(engine.run())
+        finally:
+            engine.close()
+
+    def _window_snapshot(self) -> dict[str, dict]:
+        storage = Storage(self.state_dir)
+        try:
+            return {r["order_id"]: r for r in storage.read_snapshot("window")}
+        finally:
+            storage.close()
+
+    def test_baseline_sets_change_cursor_without_rescanning_next_round(self):
+        self._sync()
+        storage = Storage(self.state_dir)
+        progress = storage.get_progress("window")
+        storage.close()
+        self.assertEqual(progress["mode"], "changes")
+        self.assertEqual(
+            progress["since"], self.server.gateway.window_log.high_watermark
+        )
+        scans_after_baseline = admin_stats(self.base_url)["window_scans"]
+        self.assertGreater(scans_after_baseline, 0)
+
+        # 日常一轮：即便没有任何变更，也只走变更流，不再扫历史时间窗
+        self._sync()
+        stats = admin_stats(self.base_url)
+        self.assertEqual(stats["window_scans"], scans_after_baseline)
+        self.assertGreater(stats["window_change_pages"], 0)
+
+    def test_append_correct_retract_are_applied(self):
+        self._sync()
+        base = self._window_snapshot()
+        # 取一个有多个修订的单用于撤回其最高修订，验证回落到次高
+        by_track: dict[str, list[dict]] = {}
+        for row in self.server.gateway.window_log.rows():
+            by_track.setdefault(row["order_id"], []).append(row)
+        multi_id, multi_rows = next(
+            (oid, rows) for oid, rows in by_track.items() if len(rows) >= 2
+        )
+        top_rev = max(r["revision"] for r in multi_rows)
+        second_rev = max(r["revision"] for r in multi_rows if r["revision"] < top_rev)
+        rev1 = next(
+            r for r in self.server.gateway.window_log.rows()
+            if r["revision"] == 1 and r["order_id"] != multi_id
+        )
+
+        inject_window_change(
+            self.base_url,
+            {
+                "type": "append",
+                "order_id": "QC-9999",
+                "revision": 1,
+                "inspected_at": "2026-11-09T00:00:00",
+                "gaps": [{"point": "rail", "value": 9000, "unit": "um"}],
+            },
+        )
+        inject_window_change(
+            self.base_url,
+            {
+                "type": "correct",
+                "order_id": rev1["order_id"],
+                "revision": 1,
+                "inspected_at": rev1["inspected_at"],
+                "gaps": [{"point": "rail", "value": 12345, "unit": "um"}],
+            },
+        )
+        inject_window_change(
+            self.base_url,
+            {"type": "retract", "order_id": multi_id, "revision": top_rev},
+        )
+
+        self._sync()
+        snap = self._window_snapshot()
+
+        # 补发：新单号出现，单位已归一为 mm
+        self.assertIn("QC-9999", snap)
+        self.assertAlmostEqual(snap["QC-9999"]["gaps"][0]["value_mm"], 9.0)
+
+        # 更正：同单号同修订，读数被更新
+        self.assertAlmostEqual(
+            snap[rev1["order_id"]]["gaps"][0]["value_mm"], 12.345
+        )
+
+        # 撤回最高修订：回落到次高修订，单号仍在
+        self.assertEqual(snap[multi_id]["revision"], second_rev)
+        self.assertEqual(base[multi_id]["revision"], top_rev)
+
+        # 撤回"唯一修订"的单号：整单消失
+        only_rev1 = next(
+            oid for oid, row in base.items()
+            if row["revision"] == 1 and oid != rev1["order_id"]
+        )
+        inject_window_change(
+            self.base_url,
+            {"type": "retract", "order_id": only_rev1, "revision": 1},
+        )
+        self._sync()
+        self.assertNotIn(only_rev1, self._window_snapshot())
+
+    def test_each_round_caps_at_startup_watermark(self):
+        self._sync()
+        inject_window_change(
+            self.base_url,
+            {"type": "append", "order_id": "QC-8888", "revision": 1,
+             "inspected_at": "2026-11-09T00:00:00",
+             "gaps": [{"point": "rail", "value": 8.0, "unit": "mm"}]},
+        )
+        # 本轮启动后、采集过程中再加入一条变更：应留到下一轮
+        added_during: dict[str, bool] = {"done": False}
+
+        async def add_late(source: str, pages: int):
+            if source == "window" and not added_during["done"]:
+                added_during["done"] = True
+                inject_window_change(
+                    self.base_url,
+                    {"type": "append", "order_id": "QC-7777", "revision": 1,
+                     "inspected_at": "2026-11-09T00:00:00",
+                     "gaps": [{"point": "rail", "value": 8.0, "unit": "mm"}]},
+                )
+
+        self._sync(page_size=1, on_page=add_late)
+        snap = self._window_snapshot()
+        self.assertIn("QC-8888", snap)   # 启动前已存在的变更被采到
+        self.assertNotIn("QC-7777", snap)  # 启动后才出现的留到下一轮
+
+        self._sync()
+        self.assertIn("QC-7777", self._window_snapshot())
+
+    def test_resume_change_pages_does_not_refetch_saved_pages(self):
+        self._sync()
+        for i in range(5):
+            inject_window_change(
+                self.base_url,
+                {"type": "append", "order_id": f"QC-LATE-{i}", "revision": 1,
+                 "inspected_at": "2026-11-09T00:00:00",
+                 "gaps": [{"point": "rail", "value": 8.0 + i, "unit": "mm"}]},
+            )
+
+        pages: list[int] = []
+
+        async def abort_after_two(source: str, page: int):
+            if source != "window":
+                return
+            pages.append(page)
+            if len(pages) >= 2:
+                raise AbortSync("模拟变更追赶中途中止")
+
+        with self.assertRaises(AbortSync):
+            self._sync(page_size=2, on_page=abort_after_two)
+
+        storage = Storage(self.state_dir)
+        progress = storage.get_progress("window")
+        # 已消费 2 页（每页 2 条），续点=4
+        self.assertEqual(progress["mode"], "changes")
+        self.assertEqual(progress["since"], 4)
+        self.assertEqual(progress["done"], False)
+        self.assertIsNotNone(progress["until"])
+        storage.close()
+
+        before = admin_stats(self.base_url)
+        # 续跑：沿用原 until，从 since=4 拉下一页，已保存页面不再重拉
+        self._sync(page_size=2)
+        after = admin_stats(self.base_url)
+        self.assertEqual(after["window_scans"], before["window_scans"])
+        # 续跑直接沿用原 until，只拉下一页变更（4->5），不重取高水位、不重拉已存页
+        self.assertEqual(
+            after["window_change_pages"] - before["window_change_pages"], 1
+        )
+
+        snap = self._window_snapshot()
+        for i in range(5):
+            self.assertIn(f"QC-LATE-{i}", snap)
+        storage = Storage(self.state_dir)
+        self.assertTrue(storage.get_progress("window")["done"])
+        storage.close()
+
+    def test_expired_change_cursor_rebuilds_baseline(self):
+        server = start_server(window_change_retention=3)
+        base_url = (
+            f"http://{server.server_address[0]}:{server.server_address[1]}"
+        )
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            engine = SyncEngine(make_config(base_url, tmp.name))
+            asyncio.run(engine.run())
+            engine.close()
+
+            storage = Storage(tmp.name)
+            before = storage.read_snapshot("window")
+            old_progress = storage.get_progress("window")
+            storage.close()
+
+            # 制造超过保留窗口的变更，使已保存续点过期。
+            # 时间落在基线扫描窗口 [window_start, horizon] 内，因此全量重扫
+            # 能覆盖到它们——这也是供应商窗口的语义：窗口返回当前所有记录。
+            for i in range(6):
+                inject_window_change(
+                    base_url,
+                    {"type": "append", "order_id": f"QC-NEW-{i}", "revision": 1,
+                     "inspected_at": "2026-11-10T09:00:00",
+                     "gaps": [{"point": "rail", "value": 8.0, "unit": "mm"}]},
+                )
+            self.assertGreater(
+                server.gateway.window_log.oldest_seq,
+                old_progress["since"] + 1,
+            )
+
+            scans_before = admin_stats(base_url)["window_scans"]
+
+            # 重建期间（发布前）旧快照仍可读
+            storage = Storage(tmp.name)
+            self.assertEqual(
+                len(storage.read_snapshot("window")), len(before)
+            )
+            storage.close()
+
+            engine = SyncEngine(make_config(base_url, tmp.name))
+            results = asyncio.run(engine.run())
+            engine.close()
+            # 其他来源照常发布
+            self.assertIn("offset", results)
+            self.assertIn("cursor", results)
+
+            # 触发了全量重扫（基线重建）
+            scans_after = admin_stats(base_url)["window_scans"]
+            self.assertGreater(scans_after, scans_before)
+
+            storage = Storage(tmp.name)
+            try:
+                snap = {
+                    r["order_id"]: r for r in storage.read_snapshot("window")
+                }
+                progress = storage.get_progress("window")
+            finally:
+                storage.close()
+            # 重建后的快照 = 供应商当前状态（补发的都在，撤回的不残留）；
+            # 快照每单号只保留最高修订，故以唯一单号数比较
+            current_ids = {r["order_id"] for r in server.gateway.window_log.rows()}
+            self.assertEqual(set(snap), current_ids)
+            for i in range(6):
+                self.assertIn(f"QC-NEW-{i}", snap)
+            self.assertEqual(progress["mode"], "changes")
+            self.assertEqual(progress["done"], True)
+        finally:
+            server.shutdown()
+            tmp.cleanup()
+
+    def test_legacy_state_without_change_cursor_rebuilds(self):
+        # 模拟旧版本状态：只有 last_to，没有 mode/since
+        self._sync()
+        storage = Storage(self.state_dir)
+        storage.set_progress(
+            "window", {"last_to": "2026-11-11T00:00:00", "done": True}
+        )
+        storage.close()
+        scans_before = admin_stats(self.base_url)["window_scans"]
+        self._sync()
+        # 重建为完整基线：重新全量扫描
+        self.assertGreater(admin_stats(self.base_url)["window_scans"], scans_before)
+        storage = Storage(self.state_dir)
+        self.assertEqual(storage.get_progress("window")["mode"], "changes")
+        storage.close()
+        current_ids = {
+            r["order_id"] for r in self.server.gateway.window_log.rows()
+        }
+        self.assertEqual(set(self._window_snapshot()), current_ids)
 
 
 class SubprocessCliTests(unittest.TestCase):

@@ -191,6 +191,20 @@ class Storage:
         with self._lock:
             self._conn.execute("DELETE FROM records WHERE source=?", (source,))
 
+    def delete_record(self, source: str, order_id: str, revision: int) -> int:
+        """删除暂存区中的某个 (来源, 单号, 修订)。
+
+        用于时间窗源的"撤回"变更：该修订从供应商当前状态中消失，
+        后续发布快照时不得再出现（若撤回了最高修订，则回落到次高修订）。
+        已发布的快照不受影响，等新一轮原子发布才切换。
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM records WHERE source=? AND order_id=? AND revision=?",
+                (source, order_id, revision),
+            )
+            return cur.rowcount
+
     def _latest_revision_rows(self, source: str) -> list[dict]:
         """发布投影：每个巡检单号只保留最高修订，并保持来源清单顺序。"""
         sql = (

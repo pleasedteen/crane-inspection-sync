@@ -40,6 +40,7 @@ def cmd_serve(args) -> int:
             "window_window": args.window_window,
             "token_ttl": args.token_ttl,
             "cursor_rotate_after": args.cursor_rotate_after,
+            "window_change_retention": args.window_change_retention,
         }
     )
     host, port = server.server_address
@@ -162,6 +163,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--window-window", type=float, default=5.0)
     p_serve.add_argument("--token-ttl", type=float, default=300.0)
     p_serve.add_argument("--cursor-rotate-after", type=int, default=None)
+    p_serve.add_argument(
+        "--window-change-retention", type=int, default=None,
+        help="时间窗变更日志保留条数；续点早于保留范围时返回 410",
+    )
     p_serve.set_defaults(func=cmd_serve)
 
     p_sync = sub.add_parser("sync", help="执行一轮同步并发布各来源快照")
